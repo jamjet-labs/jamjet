@@ -66,6 +66,9 @@ pub enum IrError {
     #[error("node '{0}' sets agent_tool_dispatch but is not the ADK tool dispatcher ({1}); the flag is reserved for jamjet.agents.tool_runtime:dispatch_tool_calls")]
     MisplacedAgentToolDispatch(String, String),
 
+    #[error("node '{node}' is a {kind} node; `executor` applies to model nodes only")]
+    MisplacedExecutor { node: String, kind: String },
+
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 

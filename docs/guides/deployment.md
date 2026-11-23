@@ -172,6 +172,208 @@ worker has to call `POST /work-items/claim` with the run's `execution_id`.
 This decides who runs the node and reports its result, not who can read the
 run: `GET /executions/:id` shows its state to any token of the tenant.
 
+#### Model steps run by the run's own worker
+
+A `model` node can leave its model call to the run's own worker: the process
+that holds the token that started the run, which may send the call on through
+a router of its own. Set `executor` in the node's kind:
+
+```json
+"think": { "kind": { "type": "model", "model_ref": "planner",
+                     "prompt_ref": "Find a venue in {{ state.city }}",
+                     "output_schema": "answer", "tools": [ ... ],
+                     "executor": "worker" } }
+```
+
+- `executor` is `engine` (the default) or `worker`. `POST /workflows` refuses
+  it on any kind but `model` (400), and refuses `claim` on a `model` node: a
+  worker model step is always claimed by execution. It goes inside `kind`. Put
+  at the node's top level it is ignored, and the engine makes the call.
+- The YAML compiler and the Python SDK do not write it yet. A client that does
+  should write it only for `worker`: `"executor": null` is refused on every
+  kind.
+- The step goes to the built-in queue `model_worker`. Only a claim that names
+  the run gets it: the oldest-first claim never hands it out, the engine's own
+  workers never run it, and `jamjet worker` does not claim it. While nobody
+  claims it the step stays pending and the run waits. A new `external_fn`
+  version may not name `model_worker` as its queue.
+- `POST /work-items` refuses such a node (400). Its payload is the request the
+  claim hands out, and only the engine builds it, from the run's state.
+- A step of such a node written straight into the store on the engine's
+  `model` queue is run by the engine. The run's worker cannot complete or fail
+  it (403), and any other token is told `404`, as for every step of the node.
+- A runtime from before this change drops `executor` and makes the call
+  itself. Check the runtime version before you rely on it.
+
+The claim is a claim by execution, as above:
+
+```json
+POST /work-items/claim
+{ "worker_id": "router-1", "queue_types": ["model_worker"],
+  "execution_id": "exec_...", "wait_ms": 5000 }
+```
+
+```json
+{ "claimed": true, "work_item": {
+    "id": "...", "execution_id": "...", "node_id": "think",
+    "queue_type": "model_worker", "attempt": 0,
+    "lease_fence": 4294967297, "lease_secs": 60, "idempotency_key": "...",
+    "payload": { "workflow_id": "w", "workflow_version": "0.1.0", "node_id": "think",
+                 "model": "vertex_ai/gemini-2.5-pro", "temperature": 0.5, "max_tokens": 512,
+                 "system_prompt": "You plan events.", "tools": [ ... ],
+                 "prompt": "Find a venue in Lisbon", "output_schema": "answer",
+                 "claim": "by_execution" },
+    "budget_left": { "total_tokens": 1200, "input_tokens": null,
+                     "output_tokens": null, "cost_usd": 0.42 } } }
+```
+
+- The claim runs the same gate as every item: the model the payload names
+  against the allow lists (tenant, workflow, node), the agent card, autonomy
+  limits (the step is counted as an agent step when it is claimed), approvals
+  and the run's caps. A spent run answers `budget`. A node an approval gates
+  answers `approval_required` until it is decided. A model off an allow list
+  answers `blocked`, and the node fails.
+- The payload is the request the engine built: the model id and its settings,
+  the system prompt, the tool schemas, the node's `output_schema`, and the
+  node's prompt rendered against the run's state. A node with no prompt sends
+  the conversation in the run's `state.messages` instead, which earlier steps
+  of the run wrote.
+- A step whose request has no prompt to send fails at claim, with the words
+  the in-process model executor uses, and the claim answers `blocked`. That is
+  a prompt template that names a state key the run lacks, or no prompt and no
+  conversation. The worker never sends a prompt of its own making.
+- `budget_left` is what the run's caps leave, counted at claim from the same
+  read of the run's log that decided the step may fire. It sits beside
+  the payload, so the payload and the digests that bind it are unchanged. A
+  field is null when the run has no such cap, and 0 when the engine cannot
+  check that cap (a step left out a count it reads, or the stored dollar cap
+  is not a valid one). It is never negative. Other steps of the run can spend
+  after the claim, so it is a limit to pass to the model, not a promise: the
+  engine still enforces the caps.
+- A step claimed again after its lease ran out, by any worker of the run,
+  carries the same `idempotency_key`, as long as the run's state is the same
+  at both claims. The key covers the state, as it does for every external
+  step, so another branch of the run that writes state in between gives the
+  retry a new key. A router that keeps answers by that key can answer a retry
+  without paying again.
+
+The worker completes the step with the model's answer, never with an output or
+a state patch:
+
+```json
+POST /work-items/:id/complete
+{ "lease_fence": 4294967297, "idempotency_key": "...", "duration_ms": 1840,
+  "model_result": { "content": "", "finish_reason": "tool_calls",
+                    "model": "vertex_ai/gemini-2.5-pro",
+                    "tool_calls": [ { "id": "c1", "name": "search", "arguments": { "q": "venues" } } ],
+                    "input_tokens": 812, "output_tokens": 95, "cost_usd": 0.0031 } }
+```
+
+- `content`, `finish_reason` and `model` are required. `content` is a string:
+  send `""` when the provider returned no text with its tool calls.
+  `tool_calls` is optional, a flat list of `{id, name, arguments}`.
+  `input_tokens` and `output_tokens` are required, 0 included. `cost_usd` is
+  optional; `cost_currency`, if sent, must be `USD`. Fields the engine does
+  not read are ignored.
+- The engine builds the step's output and state patch from the answer with the
+  in-process model executor's own function, so the two executors record the
+  same step. The output is `content`, `model`, `finish_reason` and
+  `tool_calls`. The state patch is exactly `last_model_output`,
+  `last_model_finish_reason` and `last_model_tool_calls`. The calls then reach
+  the next tool dispatch node, as an in-process model step's do, and each one
+  passes the dispatch guard there: a blocked call fails that node, as it would
+  for a model the engine called.
+
+The checks, in order. Each refusal answers `{"completed": false, "reason":
+"..."}` and records nothing, except where the table says the step fails.
+
+| What was sent | Answer |
+|---|---|
+| By a caller who may not claim the item | `404`, whatever the body says |
+| No `lease_fence`, or one the item no longer holds: an answer after the lease ran out (read on the store's clock, whether or not anything has taken the step back yet), or the same answer sent twice | `409` |
+| `output` or `state_patch`; no `model_result`; usage beside `model_result` instead of in it (`input_tokens`, `output_tokens`, `cost_usd`, `cost_currency`, `finish_reason`, `gen_ai_model`, `gen_ai_system`) | `400` |
+| A `model_result` that does not parse: a cost sent as a string, a token count that is negative or not whole, `content` that is not a string, a call with no name | `422`. When the usage is what does not parse, a cap that reads it fails the step for good, as for usage left out: a token count under any cap, a cost under a dollar cap. An answer that does not parse and leaves out a token count does the same under any cap, whatever else is wrong with it |
+| A token count left out, or a cost that is not a number from 0 to 10,000 in USD | `400`. Under a cap that cannot count it the step fails for good in the same write, and the answer says so: missing tokens under any cap, a bad cost under a dollar cap |
+| A `model` that is empty, longer than 256 characters or holds a control or invisible format character; more than 256 calls; `finish_reason` `tool_calls` with no calls, or calls with any other `finish_reason`; a call id that is empty or used twice; a call to a tool the registered node does not offer | `422` |
+| A block or a gate put on after the claim | `409` |
+| A `model` off an allow list (tenant, workflow or node) | `409`. A `PolicyViolation` "model used is not allowed: <model>" is recorded and the step fails for good |
+| Anything else | `200`. `NodeCompleted` is recorded under the engine's idempotency key, in one fenced write. The scheduler's next pass fails a run past its cap |
+
+A `503` means the engine could not read what it needed to decide, or could
+not tell whether its write landed (a Postgres `COMMIT` that failed). Send the
+same answer again. If that answer is a `409`, read the run to see whether the
+first one was recorded.
+
+A worker that hands the call to a router should pass it the run id, the node
+id, the attempt and the idempotency key, so the router can tell a retry from a
+new call. A `422` will never be recorded as sent. Treat it as a failed
+attempt: report it on `POST /work-items/:id/fail` with the `lease_fence`, so
+the step is retried, rather than sending the same answer again.
+
+Under a dollar cap, an answer with no `cost_usd` is recorded with its cost
+unknown, and the run fails on the next pass with `cost_not_reported`. It is
+answered `200` and recorded, so do not send it again. A negative cost, or one
+over the ceiling, is a `400` and is not recorded. With no dollar cap, no cost
+is fine.
+
+Where the two executors still differ:
+
+- The worker's step does not write the `__budget` display counters the
+  in-process worker writes. The caps read the log, not those counters.
+- The `jamjet.node` span, its GenAI attributes and the
+  `gen_ai.client.token.usage` metric are recorded for steps the engine runs
+  only. A worker's model step is on the log and in `usage`, not in them.
+- The spend of a step that fails for good is not on the log, as for any failed
+  attempt. That covers a model off an allow list, and tokens or a cost a cap
+  cannot count. The run's `usage` does not include that call.
+
+A long output (above `JAMJET_ARTIFACT_THRESHOLD_BYTES`, 8 KiB by default) is
+moved to the artifact store on both executors, and the event records the same
+reference. The state patch stays inline.
+
+The completion of every other kind is unchanged: it still needs `output` and
+`state_patch` (422 without them), and `model_result` on one is a 400.
+
+#### What the engine checks, and what it trusts
+
+The worker here is the run's own code, holding the token that started the run.
+The engine cannot stop it doing anything on its own machine. What the engine
+guarantees is what it hands out, what it records and what it moves past.
+
+The worker is trusted for two things:
+
+- The model's answer: its text and its tool calls. This is model output, which
+  is untrusted text in any case.
+- The usage it reports: the tokens, the cost and the model id.
+
+The engine checks everything else, every time:
+
+| What | How |
+|---|---|
+| Who may claim | By execution only, and only the run's initiator. Anyone else is told `not_found` at claim, and `404` on complete, fail and heartbeat. |
+| The model | The allow lists (tenant, workflow, node) at claim, against the model the request names, and at completion, against the model the worker reports. |
+| The caps | Checked at claim. A run past its cap fails in the next pass. Under a cap, an answer whose cost or tokens cannot be counted fails the step. |
+| The tools | Every call the model asks for goes to a tool dispatch node and passes its guard: blocks, approvals, the agent card's lists. A call to a tool the node did not offer is refused at completion. |
+| The state | The engine builds the output and the state patch from the answer, with the in-process function. The worker cannot write any state key, the engine's included. |
+| The lease | A fenced completion only. A late or repeated answer is a `409` and records nothing. |
+| The kind | Only a `model` node marked `executor: worker` reaches this queue. A kind the engine runs never does. |
+
+Put plainly: a lying worker can report less spend than it made, since the caps
+hold only as well as the report (the caller's router keeps the money
+boundary), and it can name a model it did not use. It cannot run a blocked
+tool through the engine, skip an approval, write another run's log, write the
+engine's state keys, be recorded after its lease, or get a step on a spent
+run.
+
+Two narrow gaps remain, both in the audit log, neither in the run's state:
+
+- A model off an allow list, reported after the run was cancelled, records its
+  `PolicyViolation` in the cancelled run's log. The answer is then a `409` and
+  the item is withdrawn.
+- If another claim takes the lease back between the engine's last read of it
+  and the write of that violation, the violation is recorded for a step the
+  new holder then runs.
+
 ### 4. Register workflows
 
 ```bash

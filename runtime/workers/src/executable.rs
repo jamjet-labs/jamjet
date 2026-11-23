@@ -35,6 +35,9 @@ pub const EXTERNAL_WORKER_KINDS: &[&str] = &["python_fn", "java_fn", "external_f
 /// node with a state patch of its choosing, or a `condition` node with the
 /// route it wants. No external kind is dispatched to them (an `external_fn`
 /// queue cannot take a built-in name).
+///
+/// `model_worker` is not one of them: a `model` node with `executor: worker`
+/// goes there, and the run's own worker claims it by execution.
 pub const ENGINE_QUEUES: &[&str] = &["model", "general"];
 
 /// How this runtime executes a node kind.
@@ -59,8 +62,17 @@ pub fn runner_for(kind: &str) -> Runner {
     }
 }
 
-/// How this runtime executes `kind`.
+/// How this runtime executes `kind`. A `model` node with `executor: worker`
+/// is run by the run's own worker, over the claim protocol; every other
+/// `model` node by the engine. Every other kind is decided by its tag.
 pub fn runner_for_kind(kind: &jamjet_core::node::NodeKind) -> Runner {
+    use jamjet_core::node::{ModelExecutor, NodeKind};
+    if let NodeKind::Model { executor, .. } = kind {
+        return match executor {
+            ModelExecutor::Engine => Runner::InProcess,
+            ModelExecutor::Worker => Runner::ExternalWorker,
+        };
+    }
     runner_for(&node_kind_tag(kind))
 }
 
@@ -144,6 +156,16 @@ mod tests {
                 q.as_str()
             );
         }
+        // A model node run by the run's own worker is external work: not on
+        // an engine queue, and never run in process.
+        let worker_model: NodeKind = serde_json::from_value(serde_json::json!({
+            "type": "model", "model_ref": "m", "prompt_ref": "", "output_schema": "",
+            "system_prompt": null, "executor": "worker"
+        }))
+        .unwrap();
+        assert!(!ENGINE_QUEUES.contains(&worker_model.queue_type().as_str()));
+        assert_eq!(runner_for_kind(&worker_model), Runner::ExternalWorker);
+        assert_eq!(runner_for_kind(&kind("model")), Runner::InProcess);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use jamjet_state::approvals::{
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
 use jamjet_state::Event;
-use jamjet_state::{fold_run_usage, RunCaps};
+use jamjet_state::{fold_run_usage, RunCaps, RunUsage};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -205,11 +205,97 @@ pub async fn guard_item(
     lease_fence: Option<i64>,
     caps: Option<&RunCaps>,
 ) -> GuardOutcome {
+    guard_item_counted(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        tenant_id,
+        workflow_policy,
+        node_def,
+        payload,
+        sealer,
+        agents,
+        work_item_id,
+        lease_fence,
+        caps,
+    )
+    .await
+    .0
+}
+
+/// [`guard_item`], with the run's usage as the firing check counted it, for a
+/// caller that tells the step what its caps leave. `Some` only in `Fire`
+/// mode, for a step the caps were read for (a node that can spend, a run with
+/// a cap) and that they let fire.
+///
+/// That count is the one the decision was made on, and it is read before the
+/// guard records anything (an agent's admitted step, an approval request). A
+/// caller that counted again after `Allow` could find the log unreadable with
+/// a step already admitted, or find a sibling's spend that the decision did
+/// not see.
+#[allow(clippy::too_many_arguments)]
+pub async fn guard_item_counted(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
+    agents: AgentScope<'_>,
+    work_item_id: Option<uuid::Uuid>,
+    lease_fence: Option<i64>,
+    caps: Option<&RunCaps>,
+) -> (GuardOutcome, Option<RunUsage>) {
+    let mut counted = None;
+    let outcome = decide(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        tenant_id,
+        workflow_policy,
+        node_def,
+        payload,
+        sealer,
+        agents,
+        work_item_id,
+        lease_fence,
+        caps,
+        &mut counted,
+    )
+    .await;
+    (outcome, counted)
+}
+
+/// The body of [`guard_item`]. `counted` is set to the usage the firing
+/// check read, once it let the step fire.
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
+    agents: AgentScope<'_>,
+    work_item_id: Option<uuid::Uuid>,
+    lease_fence: Option<i64>,
+    caps: Option<&RunCaps>,
+    counted: &mut Option<RunUsage>,
+) -> GuardOutcome {
     use crate::agent_limits;
 
     if mode == GuardMode::Fire {
-        if let Err(refused) = caps_allow(backend, execution_id, node_id, node_def, caps).await {
-            return refused;
+        match caps_allow(backend, execution_id, node_id, node_def, caps).await {
+            Ok(usage) => *counted = usage,
+            Err(refused) => return refused,
         }
     }
 
@@ -339,6 +425,94 @@ pub async fn guard_item(
     }
 }
 
+/// Every rule recorded when the model a run's worker reports it used is off
+/// an allow list starts with this; the model follows after `: `.
+pub const MODEL_USED_RULE: &str = "model used is not allowed";
+
+/// May the answer of a model step its run's own worker ran be recorded,
+/// given the model the worker reports it used? That model is held to the
+/// same allow lists the requested model was held to at claim: the tenant's,
+/// a ceiling, and the IR's, where the node's replaces the workflow's. A
+/// worker can call another model than the one it was handed.
+///
+/// Only the allow lists are read. Everything else about the step (blocks,
+/// approvals, the agent's card) is decided for the result by [`guard_item`]
+/// in [`GuardMode::Complete`], from the request the step was claimed with.
+///
+/// `Blocked` (rule [`MODEL_USED_RULE`]`: <model>`) after the
+/// `PolicyViolation` is recorded, best effort, as a firing check records
+/// one. `Unavailable` when the tenant's policy could not be read or parsed:
+/// nothing is decided and nothing is recorded.
+pub async fn reported_model_allowed(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    model: &str,
+) -> GuardOutcome {
+    let tenant = match backend
+        .get_tenant(&jamjet_state::TenantId::from(tenant_id))
+        .await
+    {
+        Ok(None) => None,
+        Ok(Some(tenant)) => match tenant.policy_set() {
+            Ok(set) => set,
+            Err(cause) => {
+                return GuardOutcome::Unavailable {
+                    reason: format!(
+                        "tenant policy for tenant {tenant_id} cannot be read ({cause}); the \
+                         model used cannot be checked"
+                    ),
+                }
+            }
+        },
+        Err(e) => {
+            return GuardOutcome::Unavailable {
+                reason: format!("tenant policy unavailable; the model used cannot be checked: {e}"),
+            }
+        }
+    };
+    let allow_list_only = |p: &PolicySetIr| PolicySetIr {
+        model_allowlist: p.model_allowlist.clone(),
+        ..PolicySetIr::default()
+    };
+    let tenant = tenant.as_ref().map(allow_list_only);
+    let workflow = workflow_policy.map(allow_list_only);
+    let node = node_def.policy.as_ref().map(allow_list_only);
+    let layers: Vec<&PolicySetIr> = workflow.iter().chain(node.iter()).collect();
+    let ctx = EvaluationContext {
+        node_id: node_id.to_string(),
+        node_kind_tag: "model".to_string(),
+        tool_name: None,
+        model_ref: Some(model.to_string()),
+    };
+    match PolicyEvaluator.evaluate_chain(&ctx, tenant.as_ref(), &layers) {
+        PolicyDecision::Block { .. } => {
+            let rule = format!("{MODEL_USED_RULE}: {model}");
+            let scope = dispatch_guard::identify_policy_scope(
+                &ctx,
+                tenant.as_ref(),
+                workflow.as_ref(),
+                node.as_ref(),
+            );
+            warn!(execution_id = %execution_id, node_id, %rule, %scope, "the model a worker reports is off an allow list");
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                rule.clone(),
+                scope,
+            )
+            .await;
+            GuardOutcome::Blocked { reason: rule }
+        }
+        // No gate is read here, so none can hold the step.
+        PolicyDecision::Allow | PolicyDecision::RequireApproval { .. } => GuardOutcome::Allow,
+    }
+}
+
 /// The node kinds that cannot spend: the engine runs them and they call no
 /// model and no tool. They fire whatever the run has spent, so a run that is
 /// exactly at its cap still reaches its end. `eval` is not one of them: an
@@ -347,8 +521,9 @@ pub const ZERO_COST_KINDS: &[&str] = &["condition", "human_approval", "limit_exc
 
 /// May a step of `node_def` fire under the run's `caps`? Folds the run's
 /// usage from its log (every segment, root first) and asks
-/// [`jamjet_state::caps::may_fire`]. `Ok` without reading anything for a
-/// kind in [`ZERO_COST_KINDS`] or a run with no cap.
+/// [`jamjet_state::caps::may_fire`]. `Ok(Some(usage))` is that usage, when
+/// the step may fire. `Ok(None)` without reading anything for a kind in
+/// [`ZERO_COST_KINDS`] or a run with no cap.
 ///
 /// A log that cannot be read, or holds an event this build cannot read, is
 /// `Unavailable`: nothing fires and nothing is recorded, and the step decides
@@ -360,13 +535,13 @@ async fn caps_allow(
     node_id: &str,
     node_def: &NodeDef,
     caps: Option<&RunCaps>,
-) -> Result<(), GuardOutcome> {
+) -> Result<Option<RunUsage>, GuardOutcome> {
     let Some(caps) = caps.filter(|c| c.token_budget.is_some() || c.cost_budget_usd.is_some())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if ZERO_COST_KINDS.contains(&jamjet_policy::engine::node_kind_tag(&node_def.kind).as_str()) {
-        return Ok(());
+        return Ok(None);
     }
     let usage = match fold_run_usage(backend, execution_id).await {
         Ok(Ok(usage)) => usage,
@@ -382,7 +557,7 @@ async fn caps_allow(
         }
     };
     let Err(trip) = jamjet_state::caps::may_fire(caps, &usage) else {
-        return Ok(());
+        return Ok(Some(usage));
     };
     let reason = trip.describe();
     warn!(execution_id = %execution_id, node_id, %reason, "run cap spent; the step does not fire");
@@ -1626,6 +1801,303 @@ mod tests {
                 "unreadable batch {payload} must not count as a number of calls"
             );
         }
+    }
+
+    /// A model step its run's worker runs, with `policy` as its own.
+    fn worker_model_node(policy: Option<Value>) -> NodeDef {
+        let mut node = json!({ "id": "think", "kind": {
+            "type": "model", "model_ref": "planner", "prompt_ref": "hi",
+            "output_schema": "", "system_prompt": null, "executor": "worker"
+        }});
+        if let Some(p) = policy {
+            node["policy"] = p;
+        }
+        serde_json::from_value(node).unwrap()
+    }
+
+    fn allow_list(models: &[&str]) -> Value {
+        json!({ "blocked_tools": [], "require_approval_for": [], "model_allowlist": models })
+    }
+
+    /// A store holding one running execution, with the default tenant's
+    /// `policy` when given.
+    async fn store_with_tenant(
+        policy: Option<Value>,
+    ) -> (std::sync::Arc<jamjet_state::InMemoryBackend>, ExecutionId) {
+        use jamjet_core::workflow::{WorkflowExecution, WorkflowStatus};
+        let backend = std::sync::Arc::new(jamjet_state::InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = chrono::Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        if let Some(policy) = policy {
+            backend
+                .create_tenant(jamjet_state::Tenant {
+                    id: "default".into(),
+                    name: "default".into(),
+                    status: jamjet_state::TenantStatus::Active,
+                    policy: Some(policy),
+                    limits: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+        }
+        (backend, eid)
+    }
+
+    /// Every `PolicyViolation` in the log, as `(rule, policy_scope)`.
+    async fn violations_in(backend: &dyn StateBackend, eid: &ExecutionId) -> Vec<(String, String)> {
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::PolicyViolation {
+                    rule, policy_scope, ..
+                } => Some((rule, policy_scope)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The model a worker reports is held to the tenant's, the workflow's
+    /// and the node's allow lists, as the requested one is at claim: the
+    /// node's replaces the workflow's, the tenant's is a ceiling. Off one,
+    /// the step is blocked with the violation on record. Only the allow lists
+    /// are read here: a tenant gate or block is the completion gate's.
+    #[tokio::test]
+    async fn a_reported_model_is_held_to_every_allow_list() {
+        let off = "model used is not allowed: openai/gpt-4o";
+        // What, the tenant's policy, the workflow's, the node's, the model
+        // reported, and the scope that blocks it (`None`: allowed).
+        type Case<'a> = (
+            &'a str,
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            &'a str,
+            Option<&'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            ("no list", None, None, None, "openai/gpt-4o", None),
+            (
+                "on the workflow's list",
+                None,
+                Some(allow_list(&["vertex_ai/*"])),
+                None,
+                "vertex_ai/gemini-2.5-pro",
+                None,
+            ),
+            (
+                "off the workflow's list",
+                None,
+                Some(allow_list(&["vertex_ai/*"])),
+                None,
+                "openai/gpt-4o",
+                Some("workflow"),
+            ),
+            (
+                "the node's list replaces the workflow's",
+                None,
+                Some(allow_list(&["vertex_ai/*"])),
+                Some(allow_list(&["openai/*"])),
+                "openai/gpt-4o",
+                None,
+            ),
+            (
+                "off the node's list",
+                None,
+                Some(allow_list(&["openai/*"])),
+                Some(allow_list(&["vertex_ai/*"])),
+                "openai/gpt-4o",
+                Some("node"),
+            ),
+            (
+                "off the tenant's list, on the workflow's",
+                Some(allow_list(&["vertex_ai"])),
+                Some(allow_list(&["openai/*"])),
+                None,
+                "openai/gpt-4o",
+                Some("tenant"),
+            ),
+            (
+                "a tenant gate and block, no list",
+                Some(json!({
+                    "blocked_tools": ["*"], "require_approval_for": ["*"], "model_allowlist": []
+                })),
+                None,
+                None,
+                "openai/gpt-4o",
+                None,
+            ),
+        ];
+        for (what, tenant, workflow, node, model, blocked_by) in cases {
+            let (backend, eid) = store_with_tenant(tenant).await;
+            let workflow: Option<PolicySetIr> =
+                workflow.map(|w| serde_json::from_value(w).unwrap());
+            let outcome = reported_model_allowed(
+                backend.as_ref(),
+                &eid,
+                "think",
+                "default",
+                workflow.as_ref(),
+                &worker_model_node(node),
+                model,
+            )
+            .await;
+            match blocked_by {
+                None => {
+                    assert!(
+                        matches!(outcome, GuardOutcome::Allow),
+                        "{what}: {outcome:?}"
+                    );
+                    assert_eq!(
+                        violations_in(backend.as_ref(), &eid).await,
+                        vec![],
+                        "{what}"
+                    );
+                }
+                Some(scope) => {
+                    assert!(
+                        matches!(&outcome, GuardOutcome::Blocked { reason } if reason == off),
+                        "{what}: {outcome:?}"
+                    );
+                    assert_eq!(
+                        violations_in(backend.as_ref(), &eid).await,
+                        vec![(off.to_string(), scope.to_string())],
+                        "{what}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tenant policy that cannot be read, or cannot be parsed, decides
+    /// nothing and records nothing.
+    #[tokio::test]
+    async fn a_reported_model_under_an_unreadable_tenant_is_not_decided() {
+        let failing = crate::test_support::FailingGetEvents::failing_tenant();
+        let eid = ExecutionId::new();
+        let outcome = reported_model_allowed(
+            &failing,
+            &eid,
+            "think",
+            "default",
+            None,
+            &worker_model_node(None),
+            "openai/gpt-4o",
+        )
+        .await;
+        assert!(
+            matches!(outcome, GuardOutcome::Unavailable { .. }),
+            "{outcome:?}"
+        );
+        assert!(failing.recorded(&eid).await.is_empty());
+
+        let (backend, eid) = store_with_tenant(Some(json!({ "model_allowlist": "openai" }))).await;
+        let outcome = reported_model_allowed(
+            backend.as_ref(),
+            &eid,
+            "think",
+            "default",
+            None,
+            &worker_model_node(None),
+            "openai/gpt-4o",
+        )
+        .await;
+        assert!(
+            matches!(outcome, GuardOutcome::Unavailable { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(violations_in(backend.as_ref(), &eid).await, vec![]);
+    }
+
+    /// The firing check hands back the usage it counted with the decision,
+    /// for a step it let fire under a cap, and for nothing else: not a
+    /// re-check, not a run with no cap, not a step it refused.
+    #[tokio::test]
+    async fn the_firing_check_hands_back_the_usage_it_counted() {
+        let caps = |total: u32| RunCaps {
+            token_budget: Some(jamjet_ir::workflow::TokenBudgetIr {
+                total_tokens: Some(total),
+                input_tokens: None,
+                output_tokens: None,
+            }),
+            cost_budget_usd: None,
+        };
+        let (backend, eid) = store_with_tenant(None).await;
+        backend
+            .append_event(Event::new(
+                eid.clone(),
+                0,
+                EventKind::NodeCompleted {
+                    node_id: "earlier".into(),
+                    output: json!({}),
+                    state_patch: json!({}),
+                    duration_ms: 1,
+                    gen_ai_system: None,
+                    gen_ai_model: Some("m".into()),
+                    input_tokens: Some(30),
+                    output_tokens: Some(20),
+                    finish_reason: None,
+                    cost_usd: None,
+                    provenance: None,
+                    idempotency_key: Some("earlier".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        let decide = |mode: GuardMode, caps: Option<RunCaps>| {
+            let (backend, eid) = (backend.clone(), eid.clone());
+            async move {
+                guard_item_counted(
+                    backend.as_ref(),
+                    mode,
+                    &eid,
+                    "think",
+                    "default",
+                    None,
+                    &worker_model_node(None),
+                    &json!({ "model": "vertex_ai/gemini-2.5-pro" }),
+                    None,
+                    AgentScope::default(),
+                    None,
+                    None,
+                    caps.as_ref(),
+                )
+                .await
+            }
+        };
+        let (outcome, counted) = decide(GuardMode::Fire, Some(caps(100))).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert_eq!(counted.map(|u| u.total_tokens()), Some(50));
+        let (outcome, counted) = decide(GuardMode::Fire, None).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert!(counted.is_none());
+        let (outcome, counted) = decide(GuardMode::Complete, Some(caps(100))).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert!(counted.is_none());
+        let (outcome, counted) = decide(GuardMode::Fire, Some(caps(50))).await;
+        assert!(matches!(outcome, GuardOutcome::Spent { .. }), "{outcome:?}");
+        assert!(counted.is_none());
     }
 
     /// The lease is decided on the store's clock, which stamped it. With the

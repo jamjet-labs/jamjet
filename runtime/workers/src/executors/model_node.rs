@@ -6,7 +6,9 @@
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_models::adapter::{ChatRole, ToolCall};
-use jamjet_models::{ChatMessage, ModelConfig, ModelError, ModelRegistry, ModelRequest};
+use jamjet_models::{
+    ChatMessage, ModelConfig, ModelError, ModelRegistry, ModelRequest, ModelResponse,
+};
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -67,6 +69,94 @@ fn tool_call_from_json(tc: &Value) -> ToolCall {
     }
 }
 
+/// Why the model step of `payload` cannot be sent to a model: the request
+/// the scheduler built holds no prompt. `None` when it holds one.
+///
+/// The executor fails the step with these words before it calls the model,
+/// not retryable: the scheduler could not render the node's prompt
+/// (`prompt_error`), or the node has no prompt and the conversation it would
+/// read is empty once a system message repeating the node's system prompt is
+/// dropped. The claim of a model step its run's worker runs fails it the same
+/// way, so that worker never sends a prompt of its own making.
+pub fn missing_prompt(payload: &Value) -> Option<String> {
+    if let Some(reason) = payload.get("prompt_error").and_then(Value::as_str) {
+        return Some(format!("ModelNodeExecutor: {reason}"));
+    }
+    let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
+    if !prompt.is_empty() {
+        return None;
+    }
+    let system_prompt = payload.get("system_prompt").and_then(Value::as_str);
+    let conversation = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // As `chat_message_from_json` reads a message: a missing role is the
+    // user's, missing content is empty.
+    let sent = conversation.iter().any(|message| {
+        let role = message.get("role").and_then(Value::as_str);
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        !(role == Some("system") && Some(content) == system_prompt)
+    });
+    (!sent).then(|| "ModelNodeExecutor: no prompt or messages provided".to_string())
+}
+
+/// What a model's answer writes for its step: the step's output (the text,
+/// the model, the finish reason and the calls) and its state patch, exactly
+/// `last_model_output`, `last_model_finish_reason` and
+/// `last_model_tool_calls`.
+///
+/// The one place these are built, for the model this executor calls and for
+/// the answer a run's own worker reports for a model step it ran, so the two
+/// record the same step and a worker never writes a state key of its own.
+///
+/// The calls are small (id, name, arguments) and go in the state patch,
+/// which is never spilled to the artifact store (unlike the output, see
+/// `worker.rs`), so the condition gate and the tool dispatch node always find
+/// them inline in the run's state. The keys are overwritten each turn: the
+/// static unroll runs model nodes one after another, and a turn's condition
+/// reads after that turn's model node completes.
+pub fn model_outcome(response: &ModelResponse) -> (Value, Value) {
+    let tool_calls: Vec<Value> = response
+        .tool_calls
+        .iter()
+        .map(|tc| {
+            json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
+        })
+        .collect();
+    let output = json!({
+        "content": response.content,
+        "model": response.model,
+        "finish_reason": response.finish_reason,
+        "tool_calls": tool_calls,
+    });
+    let state_patch = json!({
+        "last_model_output": response.content,
+        "last_model_finish_reason": response.finish_reason,
+        "last_model_tool_calls": tool_calls,
+    });
+    (output, state_patch)
+}
+
+/// The provider a model id names, for telemetry (`gen_ai.system`), with or
+/// without a `provider/` prefix: `anthropic/claude-sonnet-4-6` and
+/// `claude-sonnet-4-6` are both `anthropic`.
+pub fn gen_ai_system(model: &str) -> &'static str {
+    let bare = model.split_once('/').map(|(_, m)| m).unwrap_or(model);
+    if model.starts_with("anthropic/") || bare.starts_with("claude") {
+        "anthropic"
+    } else if model.starts_with("openai/") || bare.starts_with("gpt") || bare.starts_with("o1") {
+        "openai"
+    } else {
+        "unknown"
+    }
+}
+
 /// Executor for `model` workflow nodes.
 pub struct ModelNodeExecutor {
     registry: Arc<ModelRegistry>,
@@ -84,12 +174,13 @@ impl NodeExecutor for ModelNodeExecutor {
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
-        // The scheduler could not produce the node's prompt (a template naming
-        // state the run does not have, or a prompt file it cannot read). Fail
-        // with that reason rather than call the model without the prompt.
-        // Not retryable: the item's payload, and so the reason, is fixed.
-        if let Some(reason) = item.payload.get("prompt_error").and_then(|v| v.as_str()) {
-            return Err(ExecutorError::Fatal(format!("ModelNodeExecutor: {reason}")));
+        // No prompt to send: the scheduler could not produce the node's prompt
+        // (a template naming state the run does not have, or a prompt file it
+        // cannot read), or there is neither a prompt nor a conversation. Fail
+        // with the reason rather than call the model without one. Not
+        // retryable: the item's payload, and so the reason, is fixed.
+        if let Some(reason) = missing_prompt(&item.payload) {
+            return Err(ExecutorError::Fatal(reason));
         }
 
         // Extract model config from the work item payload.
@@ -146,16 +237,14 @@ impl NodeExecutor for ModelNodeExecutor {
             }
         }
 
-        if messages.is_empty() {
-            return Err("ModelNodeExecutor: no prompt or messages provided".into());
-        }
-
         // A system message in the conversation with the same text as the node's
         // prompt is a duplicate of it. Drop the message and keep the configured
         // prompt, which adapters place first. A different system message stays.
         if let Some(sp) = system_prompt.as_deref() {
             messages.retain(|m| !(matches!(m.role, ChatRole::System) && m.content == sp));
         }
+        // `missing_prompt` above refused a request this leaves empty. Never
+        // call the model with nothing to answer, should the two disagree.
         if messages.is_empty() {
             return Err("ModelNodeExecutor: no prompt or messages provided".into());
         }
@@ -214,75 +303,15 @@ impl NodeExecutor for ModelNodeExecutor {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Serialize tool_calls to JSON values.  These are small (id/name/arguments
-        // only) and are intentionally placed in state_patch so they NEVER get
-        // spilled to the artifact store (state_patch stays inline per the 2i
-        // spill comment in worker.rs:430-434).
-        let tool_calls_json: Vec<serde_json::Value> = response
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "id": tc.id,
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                })
-            })
-            .collect();
-
-        // Build output — carries content + tool_calls + finish_reason.
-        // Note: if content is large, the output blob may be spilled to the
-        // artifact store (2i).  tool_calls and finish_reason are ALSO written to
-        // state_patch (see below) so the condition gate and tool nodes always
-        // find them inline in current_state, even if the output was spilled.
-        let output: Value = json!({
-            "content": response.content,
-            "model": response.model,
-            "finish_reason": response.finish_reason,
-            "tool_calls": tool_calls_json,
-        });
-
-        // State patch: write model outputs inline into workflow state.
-        // Convention for 2j-3's condition gate and tool-dispatch nodes:
-        //   state["last_model_finish_reason"] — "tool_calls", "stop", etc.
-        //   state["last_model_tool_calls"]    — [{id, name, arguments}, ...]
-        //   state["last_model_output"]        — content text (last model turn)
-        // These keys are safe to overwrite per turn because the static unroll
-        // executes model nodes sequentially; the condition gate for turn N always
-        // reads after that turn's model node completes.
-        let state_patch = json!({
-            "last_model_output": response.content,
-            "last_model_finish_reason": response.finish_reason,
-            "last_model_tool_calls": tool_calls_json,
-        });
+        // The output may be spilled to the artifact store when it is large
+        // (2i); the calls and the finish reason are in the state patch too.
+        let (output, state_patch) = model_outcome(&response);
 
         Ok(ExecutionResult {
             output,
             state_patch,
             duration_ms,
-            gen_ai_system: Some(
-                {
-                    // Infer the provider from the model name, tolerating an optional
-                    // "provider/" prefix (e.g. "anthropic/claude-sonnet-4-6" or bare
-                    // "claude-sonnet-4-6" both classify as "anthropic").
-                    let bare = response
-                        .model
-                        .split_once('/')
-                        .map(|(_, m)| m)
-                        .unwrap_or(response.model.as_str());
-                    if response.model.starts_with("anthropic/") || bare.starts_with("claude") {
-                        "anthropic"
-                    } else if response.model.starts_with("openai/")
-                        || bare.starts_with("gpt")
-                        || bare.starts_with("o1")
-                    {
-                        "openai"
-                    } else {
-                        "unknown"
-                    }
-                }
-                .to_string(),
-            ),
+            gen_ai_system: Some(gen_ai_system(&response.model).to_string()),
             gen_ai_model: Some(response.model),
             input_tokens: Some(response.input_tokens),
             output_tokens: Some(response.output_tokens),
@@ -818,6 +847,168 @@ mod tests {
         let req = captured.lock().unwrap().clone().expect("request captured");
         assert_eq!(req.messages[1].tool_call_id, None);
         assert_eq!(req.messages[2].tool_call_id, None);
+    }
+
+    /// What an answer writes: the output and exactly the three state keys,
+    /// each call as `{id, name, arguments}`.
+    #[test]
+    fn model_outcome_builds_the_output_and_the_three_state_keys() {
+        let response = ModelResponse {
+            content: "Two venues fit.".to_string(),
+            model: "vertex_ai/gemini-2.5-pro".to_string(),
+            finish_reason: "tool_calls".to_string(),
+            input_tokens: 812,
+            output_tokens: 95,
+            structured: Some(json!({ "ignored": true })),
+            tool_calls: vec![ToolCall {
+                id: "c1".to_string(),
+                name: "search".to_string(),
+                arguments: json!({ "q": "venues" }),
+            }],
+            cost_usd: Some(0.0031),
+        };
+        let (output, state_patch) = model_outcome(&response);
+        assert_eq!(
+            output,
+            json!({
+                "content": "Two venues fit.",
+                "model": "vertex_ai/gemini-2.5-pro",
+                "finish_reason": "tool_calls",
+                "tool_calls": [ { "id": "c1", "name": "search", "arguments": { "q": "venues" } } ]
+            })
+        );
+        assert_eq!(
+            state_patch,
+            json!({
+                "last_model_output": "Two venues fit.",
+                "last_model_finish_reason": "tool_calls",
+                "last_model_tool_calls": [
+                    { "id": "c1", "name": "search", "arguments": { "q": "venues" } }
+                ]
+            })
+        );
+    }
+
+    /// The executor's result is the one `model_outcome` builds.
+    #[tokio::test]
+    async fn the_executor_records_what_model_outcome_builds() {
+        let executor = make_executor(FakeKind::ToolCallResponse);
+        let result = executor.execute(&make_item_with_tools()).await.unwrap();
+        let response = ModelResponse {
+            content: "".to_string(),
+            model: "fake-model".to_string(),
+            finish_reason: "tool_calls".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            structured: None,
+            tool_calls: vec![ToolCall {
+                id: "call_abc123".to_string(),
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"location": "London"}),
+            }],
+            cost_usd: None,
+        };
+        assert_eq!(
+            (result.output, result.state_patch),
+            model_outcome(&response)
+        );
+    }
+
+    #[test]
+    fn the_provider_is_read_from_the_model_id() {
+        for (model, system) in [
+            ("anthropic/claude-sonnet-4-6", "anthropic"),
+            ("claude-sonnet-4-6", "anthropic"),
+            ("vertex_ai/claude-sonnet-4-6", "anthropic"),
+            ("openai/gpt-4o", "openai"),
+            ("gpt-4o", "openai"),
+            ("o1-mini", "openai"),
+            ("vertex_ai/gemini-2.5-pro", "unknown"),
+            ("", "unknown"),
+        ] {
+            assert_eq!(gen_ai_system(model), system, "{model}");
+        }
+    }
+
+    const SYSTEM: &str = "You plan events.";
+
+    #[test]
+    fn a_rendered_prompt_is_a_request_to_send() {
+        for payload in [
+            json!({ "prompt": "Find a venue in Lisbon" }),
+            json!({ "prompt": "Find a venue", "system_prompt": SYSTEM }),
+            json!({ "messages": [ { "role": "user", "content": "hi" } ] }),
+            json!({ "messages": [ { "content": "no role reads as the user" } ] }),
+            json!({ "system_prompt": SYSTEM, "messages": [
+                { "role": "system", "content": "another system message" }
+            ] }),
+            json!({ "prompt": "", "messages": [ { "role": "assistant", "content": "" } ] }),
+        ] {
+            assert_eq!(missing_prompt(&payload), None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_the_scheduler_could_not_render_is_missing() {
+        let payload = json!({
+            "prompt_error": "prompt template: `{{ state.city }}`: the run's state has no `city`",
+            "messages": [ { "role": "user", "content": "a conversation to fall back on" } ]
+        });
+        assert_eq!(
+            missing_prompt(&payload).as_deref(),
+            Some(
+                "ModelNodeExecutor: prompt template: `{{ state.city }}`: the run's state has no \
+                 `city`"
+            )
+        );
+    }
+
+    #[test]
+    fn no_prompt_and_no_conversation_is_missing() {
+        let none = Some("ModelNodeExecutor: no prompt or messages provided");
+        for payload in [
+            json!({}),
+            json!({ "prompt": "" }),
+            json!({ "prompt": 7 }),
+            json!({ "messages": [] }),
+            json!({ "messages": "not a list" }),
+            json!({ "system_prompt": SYSTEM, "messages": [
+                { "role": "system", "content": SYSTEM }
+            ] }),
+        ] {
+            assert_eq!(missing_prompt(&payload).as_deref(), none, "{payload}");
+        }
+    }
+
+    /// The executor reads `prompt_error` only as text; another shape is
+    /// passed over, and the prompt decides.
+    #[test]
+    fn a_prompt_error_that_is_not_text_is_passed_over() {
+        assert_eq!(
+            missing_prompt(&json!({ "prompt_error": 1, "prompt": "Find a venue" })),
+            None
+        );
+    }
+
+    /// The executor refuses exactly what `missing_prompt` names, with its
+    /// words, before it calls the model.
+    #[tokio::test]
+    async fn the_executor_refuses_what_missing_prompt_names() {
+        for payload in [
+            json!({ "model": "fake-model" }),
+            json!({ "model": "fake-model", "prompt_error": "no `city`" }),
+            json!({ "model": "fake-model", "system_prompt": SYSTEM, "messages": [
+                { "role": "system", "content": SYSTEM }
+            ] }),
+        ] {
+            let (executor, captured) = capturing_executor();
+            let expected = missing_prompt(&payload).unwrap();
+            match executor.execute(&work_item(payload.clone())).await {
+                Err(ExecutorError::Fatal(msg)) => assert_eq!(msg, expected, "{payload}"),
+                other => panic!("{payload}: expected Fatal, got {other:?}"),
+            }
+            assert!(captured.lock().unwrap().is_none(), "{payload}: called");
+        }
     }
 
     /// Two tool calls followed by their two results keep their order and ids.

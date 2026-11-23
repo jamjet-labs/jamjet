@@ -122,11 +122,15 @@ node with no limit renews its reservation while its lease is held, and is
 abandoned once the lease is lost.
 `data_policy` is recorded in the IR and not enforced. The
 `python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
-come from the Python and Java SDKs rather than from YAML.
+come from the Python and Java SDKs rather than from YAML. A `model` node with
+`executor: worker` in its IR kind is run by the run's own worker, which claims it
+by execution and reports the model's answer; the YAML compiler does not write
+`executor` yet (see [Model steps run by the run's own
+worker](deployment.md#model-steps-run-by-the-runs-own-worker)).
 
 | Type | Description | Who runs it |
 |------|-------------|-------------|
-| `model` | LLM call | the engine |
+| `model` | LLM call | the engine, or the run's own worker with `executor: worker` |
 | `condition` | Branch on a state expression | the engine |
 | `human_approval` | Wait for a human decision | the engine |
 | `eval` | Evaluate node output with scorers *(Phase 3)* | the engine |

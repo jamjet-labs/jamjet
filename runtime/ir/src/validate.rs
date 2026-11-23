@@ -437,6 +437,41 @@ pub fn refuse_retired_timeouts(raw: &serde_json::Value) -> IrResult<()> {
     }
 }
 
+/// Refuse `executor` on a node of any kind but `model` in a raw IR document.
+///
+/// Only a `model` node has the field: it says whether the engine or the
+/// run's own worker makes the call. On another kind serde drops it, and the
+/// author would believe something about who runs the node that is not so.
+/// The parsed IR no longer has the field there, so this checks the document
+/// as sent. Nodes are checked in id order, so the same document always
+/// names the same node.
+pub fn refuse_misplaced_executor(raw: &serde_json::Value) -> IrResult<()> {
+    let Some(nodes) = raw.get("nodes").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    let mut ids: Vec<&String> = nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let Some(kind) = nodes[id].get("kind") else {
+            continue;
+        };
+        if kind.get("executor").is_none() {
+            continue;
+        }
+        let tag = kind
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("untyped");
+        if tag != "model" {
+            return Err(IrError::MisplacedExecutor {
+                node: id.clone(),
+                kind: tag.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The longest node id.
 pub const MAX_NODE_ID_LEN: usize = 128;
 
@@ -1193,5 +1228,55 @@ mod tests {
         ir.workflow_id = "数据_é_🙂".into();
         ir.version = "0.1.0".into();
         assert!(validate_identifier_chars(&ir).is_ok());
+    }
+
+    /// `executor` is a `model` field only; on any other kind it is refused,
+    /// naming the node and its kind.
+    #[test]
+    fn executor_is_refused_on_every_kind_but_model() {
+        let doc =
+            |kind: serde_json::Value| serde_json::json!({ "nodes": { "n": { "kind": kind } } });
+        for kind in [
+            serde_json::json!({ "type": "model", "executor": "worker" }),
+            serde_json::json!({ "type": "model", "executor": "engine" }),
+            serde_json::json!({ "type": "model" }),
+            serde_json::json!({ "type": "python_fn" }),
+        ] {
+            assert!(
+                refuse_misplaced_executor(&doc(kind.clone())).is_ok(),
+                "{kind}"
+            );
+        }
+        for tag in ["python_fn", "external_fn", "java_fn", "condition", "eval"] {
+            let kind = serde_json::json!({ "type": tag, "executor": "worker" });
+            match refuse_misplaced_executor(&doc(kind)) {
+                Err(IrError::MisplacedExecutor { node, kind }) => {
+                    assert_eq!((node.as_str(), kind.as_str()), ("n", tag));
+                }
+                other => panic!("{tag}: {other:?}"),
+            }
+        }
+        // A null is the field too: it says nothing a model node can mean.
+        let kind = serde_json::json!({ "type": "python_fn", "executor": null });
+        assert!(refuse_misplaced_executor(&doc(kind)).is_err());
+    }
+
+    /// `model_worker` is a built-in queue, so an `external_fn` node may not
+    /// name it.
+    #[test]
+    fn an_external_fn_queue_may_not_be_model_worker() {
+        let kind = |queue: &str| NodeKind::ExternalFn {
+            queue: queue.into(),
+            handler: "h".into(),
+            output_schema: String::new(),
+            claim: Default::default(),
+        };
+        let ir = make_ir("a", vec![("a", kind("model_worker"))], vec![("a", "end")]);
+        assert!(matches!(
+            validate_external_queues(&ir),
+            Err(IrError::InvalidQueueName { .. })
+        ));
+        let ir = make_ir("a", vec![("a", kind("model-worker"))], vec![("a", "end")]);
+        assert!(validate_external_queues(&ir).is_ok());
     }
 }

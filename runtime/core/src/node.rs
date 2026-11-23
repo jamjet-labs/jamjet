@@ -39,6 +39,14 @@ pub enum NodeKind {
         /// Empty means no tools are offered (standard text completion).
         #[serde(default)]
         tools: Vec<serde_json::Value>,
+        /// Who makes the model call. `worker`: the run's own worker, which
+        /// claims the step by execution from the `model_worker` queue and
+        /// reports the model's answer; the engine still checks the model, the
+        /// caps and every tool call, and builds the step's state itself. Left
+        /// out when it is the default, so existing node definitions, and the
+        /// approvals bound to them, are unchanged.
+        #[serde(default, skip_serializing_if = "ModelExecutor::is_engine")]
+        executor: ModelExecutor,
     },
 
     /// Python function, HTTP endpoint, or gRPC tool.
@@ -263,6 +271,10 @@ impl NodeKind {
     /// Returns the queue type this node should be dispatched to.
     pub fn queue_type(&self) -> QueueType {
         match self {
+            Self::Model {
+                executor: ModelExecutor::Worker,
+                ..
+            } => QueueType::ModelWorker,
             Self::Model { .. } => QueueType::Model,
             Self::Tool { .. } | Self::Finalizer { .. } => QueueType::Tool,
             Self::PythonFn { .. } => QueueType::PythonTool,
@@ -323,8 +335,26 @@ impl ClaimMode {
     }
 }
 
+/// Who makes a `model` node's call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelExecutor {
+    /// The engine's own model adapter, in process.
+    #[default]
+    Engine,
+    /// The run's own worker, over the claim protocol, by execution.
+    Worker,
+}
+
+impl ModelExecutor {
+    pub fn is_engine(&self) -> bool {
+        *self == Self::Engine
+    }
+}
+
 /// How `kind`'s work items may be claimed. `external_fn` and `python_fn`
-/// nodes say so themselves; every other kind is oldest-first.
+/// nodes say so themselves; a `model` node run by the run's own worker is
+/// always claimed by its execution; every other kind is oldest-first.
 ///
 /// The one place this is decided: the payload builder writes the marker
 /// from it, `POST /work-items` sets the marker from it, and the claim gate
@@ -332,6 +362,10 @@ impl ClaimMode {
 pub fn claim_mode(kind: &NodeKind) -> ClaimMode {
     match kind {
         NodeKind::ExternalFn { claim, .. } | NodeKind::PythonFn { claim, .. } => *claim,
+        NodeKind::Model {
+            executor: ModelExecutor::Worker,
+            ..
+        } => ClaimMode::ByExecution,
         _ => ClaimMode::OldestFirst,
     }
 }
@@ -351,6 +385,10 @@ pub const CLAIM_BY_EXECUTION: &str = "by_execution";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueType {
     Model,
+    /// A `model` node's call made by the run's own worker. Built in, so no
+    /// `external_fn` node may name it, and not an engine queue: the run's
+    /// worker claims from it by execution.
+    ModelWorker,
     Tool,
     PythonTool,
     JavaTool,
@@ -365,6 +403,7 @@ impl QueueType {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Model => "model",
+            Self::ModelWorker => "model_worker",
             Self::Tool => "tool",
             Self::PythonTool => "python_tool",
             Self::JavaTool => "java_tool",
@@ -378,6 +417,7 @@ impl QueueType {
     pub fn from_name(name: &str) -> Self {
         match name {
             "model" => Self::Model,
+            "model_worker" => Self::ModelWorker,
             "tool" => Self::Tool,
             "python_tool" => Self::PythonTool,
             "java_tool" => Self::JavaTool,
@@ -517,9 +557,45 @@ mod tests {
             output_schema: "schemas.Summary".into(),
             system_prompt: None,
             tools: vec![],
+            executor: ModelExecutor::Engine,
         };
         assert_eq!(node.queue_type(), QueueType::Model);
+        assert_eq!(claim_mode(&node), ClaimMode::OldestFirst);
         assert!(node.is_durable());
+    }
+
+    /// A model node run by the run's own worker goes to `model_worker`,
+    /// claimable only by its execution. `executor: engine` is the default
+    /// and is left out when serialized, so a node that does not set it
+    /// serializes as it did.
+    #[test]
+    fn a_worker_model_node_goes_to_model_worker_by_execution() {
+        let base = serde_json::json!({
+            "type": "model", "model_ref": "m", "prompt_ref": "", "output_schema": "",
+            "system_prompt": null
+        });
+        let mut worker = base.clone();
+        worker["executor"] = serde_json::json!("worker");
+        let kind: NodeKind = serde_json::from_value(worker.clone()).unwrap();
+        assert_eq!(kind.queue_type(), QueueType::ModelWorker);
+        assert_eq!(
+            serde_json::to_value(kind.queue_type()).unwrap(),
+            "model_worker"
+        );
+        assert_eq!(claim_mode(&kind), ClaimMode::ByExecution);
+        assert_eq!(serde_json::to_value(&kind).unwrap()["executor"], "worker");
+
+        let mut engine = base.clone();
+        engine["executor"] = serde_json::json!("engine");
+        for v in [base, engine] {
+            let kind: NodeKind = serde_json::from_value(v).unwrap();
+            assert_eq!(kind.queue_type(), QueueType::Model);
+            assert_eq!(claim_mode(&kind), ClaimMode::OldestFirst);
+            assert!(serde_json::to_value(&kind)
+                .unwrap()
+                .get("executor")
+                .is_none());
+        }
     }
 
     #[test]
@@ -724,5 +800,13 @@ mod queue_type_tests {
         assert_eq!(back, QueueType::PythonTool);
         let named: QueueType = serde_json::from_value(serde_json::json!("pas-control")).unwrap();
         assert_eq!(named, QueueType::Named("pas-control".into()));
+    }
+
+    /// `model_worker` is built in: the name reads back as the built-in queue,
+    /// never as a queue an `external_fn` node named.
+    #[test]
+    fn model_worker_is_a_built_in_name() {
+        assert_eq!(QueueType::from_name("model_worker"), QueueType::ModelWorker);
+        assert_eq!(QueueType::ModelWorker.as_str(), "model_worker");
     }
 }

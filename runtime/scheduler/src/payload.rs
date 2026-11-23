@@ -70,9 +70,10 @@ pub fn build_work_item_payload(
         NodeKind::Model {
             model_ref,
             prompt_ref,
+            output_schema,
             system_prompt,
             tools,
-            ..
+            executor,
         } => {
             let model_id = ir
                 .models
@@ -121,6 +122,12 @@ pub fn build_work_item_payload(
                     }
                 }
             }
+            // The run's own worker makes the call, so it is told the shape
+            // the answer should take. Only for that node, so an engine model
+            // node's payload, and the digests that bind it, are unchanged.
+            if !executor.is_engine() {
+                obj.insert("output_schema".into(), Value::String(output_schema.clone()));
+            }
         }
         // The condition executor evaluates each branch against `state` and
         // records the routing decision on NodeCompleted.
@@ -145,8 +152,9 @@ pub fn build_work_item_payload(
     }
 
     // The claim queries read this to keep the item away from the
-    // oldest-first claim. Only written for the opt-in, so other payloads
-    // (and the digests that bind them) are unchanged.
+    // oldest-first claim. Only written for the opt-in and for a model node
+    // run by the run's own worker, so other payloads (and the digests that
+    // bind them) are unchanged.
     if jamjet_core::node::claim_mode(&node.kind) == jamjet_core::node::ClaimMode::ByExecution {
         obj.insert(
             jamjet_core::node::CLAIM_PAYLOAD_KEY.into(),
@@ -441,6 +449,30 @@ mod tests {
             let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
             assert_eq!(p["claim"], "by_execution", "{p}");
         }
+    }
+
+    /// A model node run by the run's own worker carries the claim marker and
+    /// its `output_schema` on top of what an engine model node carries; an
+    /// engine model node carries neither.
+    #[test]
+    fn a_worker_model_node_carries_the_marker_and_its_output_schema() {
+        let kind = json!({
+            "type": "model", "model_ref": "m", "prompt_ref": "Summarize: {{ state.key }}",
+            "output_schema": "schemas.Summary", "system_prompt": null
+        });
+        let ir = ir_with(node(kind.clone()));
+        let engine = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert!(engine.get("claim").is_none(), "{engine}");
+        assert!(engine.get("output_schema").is_none(), "{engine}");
+
+        let mut worker_kind = kind;
+        worker_kind["executor"] = json!("worker");
+        let ir = ir_with(node(worker_kind));
+        let worker = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        let mut expected = engine.clone();
+        expected["claim"] = json!("by_execution");
+        expected["output_schema"] = json!("schemas.Summary");
+        assert_eq!(worker, expected);
     }
 
     #[test]
