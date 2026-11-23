@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
     from jamjet.deploy import DeployResult
     from jamjet.memory.engram_bridge import AgentMemory
+    from jamjet.model import Model
     from jamjet.spec import AgentSpec
 
 # Terminal execution statuses (WorkflowStatus, snake_case) the durable poll stops on.
@@ -657,6 +658,9 @@ class Agent:
         session: Session | str | None = None,
         auth: httpx.Auth | None = None,
         run_key: str | None = None,
+        drive: bool = False,
+        model: Model | None = None,
+        lease_secs: int | None = None,
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
 
@@ -669,6 +673,19 @@ class Agent:
         (see :meth:`~jamjet.client.JamjetClient.start_execution`). The engine
         must list ``run_key`` in ``/health``; when it does not, this raises
         ``EngineFeatureMissing`` before anything is registered or started.
+
+        *drive* works the run's steps in this process instead of waiting for
+        workers: its tool steps through this agent's ``@tool`` functions, its
+        worker model steps through *model* (a :class:`~jamjet.model.Model`;
+        by default the agent's own, with its governance middleware). The run's
+        tool dispatch steps are claimable only by the token that started it.
+        *lease_secs* is the lease each claim asks for. The engine must list
+        ``python_fn_by_execution`` and ``worker_model_steps`` in ``/health``,
+        else ``EngineFeatureMissing`` is raised before anything is registered.
+        See :func:`jamjet.drive.drive_run` for when a driven run returns and
+        what it raises (``RunWaiting`` for an approval, ``RunBlocked``,
+        ``RunStalled``, ``RunCancelled``). *model* and *lease_secs* need
+        ``drive=True``.
 
         Compiles the agent to an agent-loop IR (``model -> tools -> model``,
         statically unrolled and bounded by *max_turns*), registers it, then
@@ -720,6 +737,16 @@ class Agent:
         from jamjet.client import JamjetClient  # noqa: PLC0415 - patch point / avoid import cycle
         from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir  # noqa: PLC0415
 
+        if not drive:
+            given = [name for name, value in (("model", model), ("lease_secs", lease_secs)) if value is not None]
+            if given:
+                raise TypeError(f"run_durable: {' and '.join(given)} work only in drive mode; pass drive=True")
+        if model is not None:
+            from jamjet.model.seam import Model as _Model  # noqa: PLC0415
+
+            if not isinstance(model, _Model):
+                raise TypeError(f"run_durable: model must be a jamjet.model.Model, not {type(model).__name__}")
+
         # T4-2/T4-3: resolve session + memory and build the seed (session thread
         # plus the auto-retrieved "Relevant memory" block when memory is on).
         resolved_session, memory, seeded_messages = await self._prepare_run(session, prompt)
@@ -728,16 +755,23 @@ class Agent:
         else:
             initial_input = build_initial_state(self, prompt)
 
-        ir = compile_agent_to_ir(self, prompt, max_turns)
+        if drive:
+            ir = compile_agent_to_ir(self, prompt, max_turns, claim_by_execution=True)
+        else:
+            ir = compile_agent_to_ir(self, prompt, max_turns)
         workflow_id: str = ir["workflow_id"]
         workflow_version: str | None = ir.get("version")
 
         t0 = time.monotonic()
         async with JamjetClient(runtime_url, auth=auth) as client:
+            # Before any write. An engine without run_key would drop the key
+            # and start a new run on every retry; one without the drive
+            # features would refuse the IR or leave its steps unclaimable.
+            needed = ["python_fn_by_execution", "worker_model_steps"] if drive else []
             if run_key is not None:
-                # Before any write: an engine without the feature would drop
-                # the key and start a new run on every retry.
-                await client.require_features("run_key")
+                needed.append("run_key")
+            if needed:
+                await client.require_features(*needed)
             # Register the compiled IR, then start an execution seeded with the
             # running messages + tool-resolver map (build_initial_state).
             await client.create_workflow(ir)
@@ -751,10 +785,25 @@ class Agent:
             if not exec_id:
                 raise RuntimeError(f"start_execution returned no execution_id: {started!r}")
 
-            try:
-                execution = await self._poll_to_terminal(client, exec_id, runtime_url)
-            except TimeoutError as exc:
-                raise _with_execution_id(exc, exec_id)
+            if drive:
+                from jamjet.drive import DRIVE_QUEUES, drive_run  # noqa: PLC0415 - avoid an import cycle
+                from jamjet.model.defaults import default_model_middleware  # noqa: PLC0415
+                from jamjet.model.seam import Model as _Seam  # noqa: PLC0415
+
+                seam = model if model is not None else _Seam(middleware=default_model_middleware(self.governance))
+                execution = await drive_run(
+                    client,
+                    exec_id,
+                    queues=list(DRIVE_QUEUES),
+                    model=seam,
+                    run_key=run_key,
+                    lease_secs=lease_secs,
+                )
+            else:
+                try:
+                    execution = await self._poll_to_terminal(client, exec_id, runtime_url)
+                except TimeoutError as exc:
+                    raise _with_execution_id(exc, exec_id)
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
             # used only as a fallback if a spilled answer sentinel slips through.
             try:

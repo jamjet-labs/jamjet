@@ -723,6 +723,22 @@ CALLS = [
         {"worker_id": "wk-1", "queue_types": ["python_tool"], "lease_secs": 60},
     ),
     Call(
+        "claim_for_execution",
+        lambda c: c.claim_for_execution(
+            "drive-1", ["python_tool", "model_worker"], "exec_1", node_id="n1", lease_secs=60, wait_ms=10000
+        ),
+        "POST",
+        "/work-items/claim",
+        {
+            "worker_id": "drive-1",
+            "queue_types": ["python_tool", "model_worker"],
+            "execution_id": "exec_1",
+            "node_id": "n1",
+            "lease_secs": 60,
+            "wait_ms": 10000,
+        },
+    ),
+    Call(
         "complete_work_item",
         lambda c: c.complete_work_item(
             "wi-1",

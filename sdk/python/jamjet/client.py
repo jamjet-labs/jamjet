@@ -59,7 +59,8 @@ class JamjetClient:
     sends a call again when that cannot do it twice. A request that never left
     and a 429 are sent again for every call. A call that is safe to repeat
     (every GET, a heartbeat, a complete or fail with a lease fence, registering
-    a workflow, storing an artifact, a start with a ``run_key``) is also sent
+    a workflow, storing an artifact, a start with a ``run_key``, a claim for
+    one run) is also sent
     again after a lost answer or a 5xx. Any other call whose answer was lost
     raises ``OutcomeUnknown`` and is not sent again: check whether it took
     effect before you repeat it. A call whose body can be read only once (an
@@ -589,6 +590,37 @@ class JamjetClient:
         if not data.get("claimed"):
             return None
         return data["work_item"]
+
+    async def claim_for_execution(
+        self,
+        worker_id: str,
+        queue_types: list[str],
+        execution_id: str,
+        *,
+        node_id: str | None = None,
+        lease_secs: int | None = None,
+        wait_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Claim the next item of one run on ``queue_types``.
+
+        Only the token that started the run may make this claim. ``wait_ms``
+        waits up to that long (the engine allows 10000) for an item to be
+        queued. Returns the whole answer: ``{"claimed": true, "work_item": ...}``,
+        or ``{"claimed": false, "reason": ...}`` saying why nothing came back.
+
+        The same ``worker_id`` claiming again gets the item it already holds,
+        under the same lease, so a claim whose answer was lost is sent again.
+        """
+        body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types, "execution_id": execution_id}
+        if node_id is not None:
+            body["node_id"] = node_id
+        if lease_secs is not None:
+            body["lease_secs"] = int(lease_secs)
+        if wait_ms is not None:
+            body["wait_ms"] = int(wait_ms)
+        r = await self._request("POST", "/work-items/claim", json=body, safe=True, operation="claim_for_execution")
+        data = r.json()
+        return data if isinstance(data, dict) else {}
 
     async def complete_work_item(
         self,

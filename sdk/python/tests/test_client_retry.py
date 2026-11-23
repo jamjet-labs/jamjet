@@ -57,6 +57,8 @@ SAFE = {
     "deactivate_agent": False,
     "discover_agent": False,
     "claim_work_item": False,
+    # The same worker id claiming one run again gets the lease it holds.
+    "claim_for_execution": True,
     "complete_work_item": True,
     "complete_model_step": True,
     "fail_work_item": True,
