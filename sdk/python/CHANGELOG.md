@@ -135,6 +135,10 @@
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
   `pip install 'jamjet'`: Rich read `[sidecar]` as a style tag and dropped it. It now
   prints `pip install 'jamjet[sidecar]'`.
+- **A drive stops at a `human_approval` node at once.** That node puts nothing on the
+  drive's queues, so the claim said `not_ready` and `drive_run` raised `RunStalled` after
+  `stall_after_s`. It now reads `waiting_for` on the run and raises `RunWaiting` with
+  `waiting_for="approval"`, naming the node when one request is pending.
 
 ## 0.13.0 - 2026-11-18
 
