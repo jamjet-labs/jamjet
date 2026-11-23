@@ -28,6 +28,11 @@
 //! with [`arm`], or with [`arm_from_env`] in a server the test starts. A
 //! test that shares its binary with other tests arms them in a [`Scope`],
 //! and the faults reach only the calls it runs inside [`Scope::run`].
+//!
+//! A server armed from its environment says on stderr when it reaches the
+//! point, so the test that started it can tell the fault fired: an abort
+//! prints `fault point <label>#<step>: abort`, a hang `fault point
+//! <label>#<step>: hang <ms> ms` as it begins.
 
 use crate::backend::BackendResult;
 #[cfg(feature = "test-hooks")]
@@ -273,6 +278,12 @@ pub async fn hit(label: &'static str, step: u32) -> BackendResult<()> {
             "fault injected at {label}#{step}"
         ))),
         Some(Fault::Hang(how_long)) => {
+            if registry::hangs_from_env(label, step) {
+                eprintln!(
+                    "fault point {label}#{step}: hang {} ms",
+                    how_long.as_millis()
+                );
+            }
             tokio::time::sleep(how_long).await;
             Ok(())
         }
@@ -312,17 +323,42 @@ pub fn disarm_all() {
 }
 
 /// Arm [`Fault::Abort`] at the point `JAMJET_TEST_CRASH_AT` names, as
-/// `label#step`, or as a bare `label` for its step 1. Does nothing when the
-/// variable is unset, and nothing at all without the feature: the variable's
-/// name is not in such a build. Panics on a name that is not in [`POINTS`],
-/// so a mistyped point cannot pass for one that was never reached.
+/// `label#step`, or as a bare `label` for its step 1, and [`Fault::Hang`] at
+/// the point `JAMJET_TEST_HANG_AT` names, as `label#step=<milliseconds>`.
+/// Does nothing when the variables are unset, and nothing at all without the
+/// feature: their names are not in such a build. Panics on a name that is not
+/// in [`POINTS`], so a mistyped point cannot pass for one that was never
+/// reached, and on a hang with no length.
 pub fn arm_from_env() {
     #[cfg(feature = "test-hooks")]
-    if let Ok(spec) = std::env::var("JAMJET_TEST_CRASH_AT") {
-        let (label, step) =
-            point_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_CRASH_AT: {e}"));
-        arm(label, step, Fault::Abort);
+    {
+        if let Ok(spec) = std::env::var("JAMJET_TEST_CRASH_AT") {
+            let (label, step) =
+                point_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_CRASH_AT: {e}"));
+            arm(label, step, Fault::Abort);
+        }
+        if let Ok(spec) = std::env::var("JAMJET_TEST_HANG_AT") {
+            let (label, step, how_long) =
+                hang_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_HANG_AT: {e}"));
+            registry::announce_hang(label, step);
+            arm(label, step, Fault::Hang(how_long));
+        }
     }
+}
+
+/// The declared point and the hang `spec` names: `label#step=<ms>`, or
+/// `label=<ms>` for step 1.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+fn hang_named(spec: &str) -> Result<(&'static str, u32, Duration), String> {
+    let Some((point, ms)) = spec.rsplit_once('=') else {
+        return Err(format!("{spec:?}: no =<milliseconds> after the point"));
+    };
+    let ms = ms
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{spec:?}: the hang is not a whole number of milliseconds"))?;
+    let (label, step) = point_named(point)?;
+    Ok((label, step, Duration::from_millis(ms)))
 }
 
 /// The declared point `spec` names: `label#step`, or `label` for step 1.
@@ -454,6 +490,19 @@ mod registry {
     /// The faults armed for the process.
     pub(super) static GLOBAL: Mutex<Registry> = Mutex::new(Registry::new());
 
+    /// The hang the environment armed, which says on stderr when it begins.
+    /// Hangs a test arms itself stay quiet: they would print from the
+    /// runtime's threads, past the test harness's capture.
+    static ENV_HANG: std::sync::OnceLock<(&'static str, u32)> = std::sync::OnceLock::new();
+
+    pub(super) fn announce_hang(label: &'static str, step: u32) {
+        let _ = ENV_HANG.set((label, step));
+    }
+
+    pub(super) fn hangs_from_env(label: &'static str, step: u32) -> bool {
+        ENV_HANG.get() == Some(&(label, step))
+    }
+
     tokio::task_local! {
         /// The faults of the [`Scope`](super::Scope) the task runs in.
         pub(super) static SCOPED: Arc<Mutex<Registry>>;
@@ -491,5 +540,23 @@ mod tests {
         assert!(point_named(&format!("{label}#{}", step + 1000)).is_err());
         assert!(point_named(&format!("{label}#x")).is_err());
         assert!(point_named("no.such_point").is_err());
+    }
+
+    #[test]
+    fn a_hang_is_named_with_its_length() {
+        assert_eq!(
+            hang_named("sqlite.commit_turn#11=2500"),
+            Ok(("sqlite.commit_turn", 11, Duration::from_millis(2500)))
+        );
+        assert_eq!(
+            hang_named("tick.mid_walk=30"),
+            Ok(("tick.mid_walk", 1, Duration::from_millis(30)))
+        );
+        assert!(hang_named("sqlite.commit_turn#11").is_err(), "no length");
+        assert!(hang_named("sqlite.commit_turn#11=2.5s").is_err());
+        assert!(
+            hang_named("sqlite.commit_turn#99=10").is_err(),
+            "no such step"
+        );
     }
 }
