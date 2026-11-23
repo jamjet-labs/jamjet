@@ -74,7 +74,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dollar cap so does a cost that cannot be counted: the step may have paid, and a retry would
   pay again with nothing recorded. Without a cap it is a plain 400. Usage that does not parse
   (a negative, fractional or string token count, a cost that is not a number) is treated the
-  same way under a cap that reads it, and is a 422 without one.
+  same way under a cap that reads it, and is a 422 without one. So is an answer that does not
+  parse and leaves out a token count, under any cap, whatever else is wrong with it.
 - A cost left out is not a cost that cannot be counted. Under a dollar cap, an answer that is
   otherwise valid and sends no `cost_usd` is accepted (200) and recorded with its cost
   unknown, and the scheduler then fails the run with `cost_not_reported`. The answer is

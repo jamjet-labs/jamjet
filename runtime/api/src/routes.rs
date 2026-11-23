@@ -4270,8 +4270,9 @@ async fn lease_clock(
 ///    recorded already), is 409.
 /// 2. The answer is the model's. An `output`, a `state_patch` or usage
 ///    beside `model_result`, or no `model_result`, is 400; an answer that
-///    does not parse is 422. When its usage is what does not parse, a cap
-///    that reads that usage fails the step for good, as in step 3.
+///    does not parse is 422. When its usage is what does not parse, or it
+///    reports no token counts, a cap that reads that usage fails the step
+///    for good, as in step 3.
 /// 3. The usage the caps count. A token count missing is 400, and under any
 ///    cap the step fails for good. A cost that cannot be counted is 400, and
 ///    under a dollar cap the step fails for good, since it may have paid
@@ -4355,16 +4356,26 @@ async fn complete_worker_model_step(
             warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, "complete: refused a model step's answer: model_result does not parse");
             // Usage no cap can count is usage left out: under a cap that
             // reads it the step may have paid, so it fails for good, as one
-            // that reports no tokens does. The log names the field only.
+            // that reports no tokens does. An answer that does not parse and
+            // reports no token counts is one of those, whatever else is
+            // wrong with it. The log names the field only.
             if let Some(unreadable) = crate::worker_model::unreadable_usage(&raw) {
+                use crate::worker_model::UnreadableUsage;
                 let what = match unreadable {
-                    crate::worker_model::UnreadableUsage::Tokens(_) => Uncounted::Tokens,
-                    crate::worker_model::UnreadableUsage::Cost(_) => Uncounted::Cost,
+                    UnreadableUsage::Tokens(_) | UnreadableUsage::TokensMissing(_) => {
+                        Uncounted::Tokens
+                    }
+                    UnreadableUsage::Cost(_) => Uncounted::Cost,
                 };
-                let problem = format!(
-                    "model_result.{} is not a value the run's caps can count",
-                    unreadable.field()
-                );
+                let problem = match unreadable {
+                    UnreadableUsage::TokensMissing(_) => {
+                        crate::worker_model::TOKENS_REQUIRED.to_string()
+                    }
+                    _ => format!(
+                        "model_result.{} is not a value the run's caps can count",
+                        unreadable.field()
+                    ),
+                };
                 if fail_uncounted_step(
                     backend,
                     wi,

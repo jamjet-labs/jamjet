@@ -161,11 +161,7 @@ impl ModelResult {
     pub fn tokens(&self) -> Result<(u64, u64), String> {
         match (self.input_tokens, self.output_tokens) {
             (Some(input), Some(output)) => Ok((input, output)),
-            _ => Err(
-                "model_result must report input_tokens and output_tokens, which the \
-                      run's caps count"
-                    .to_string(),
-            ),
+            _ => Err(TOKENS_REQUIRED.to_string()),
         }
     }
 
@@ -253,15 +249,24 @@ impl ModelResult {
     }
 }
 
+/// The words for an answer that leaves out a token count, parsed or not.
+pub const TOKENS_REQUIRED: &str =
+    "model_result must report input_tokens and output_tokens, which the run's caps count";
+
 /// Usage in an answer that does not parse which no cap can count: a token
-/// count, or a cost, of the wrong type. Under a cap that reads it the step
-/// may have paid with nothing to count, so it fails as one that left the
-/// usage out does.
+/// count left out or of the wrong type, or a cost of the wrong type. Under a
+/// cap that reads it the step may have paid with nothing to count, so it
+/// fails as one that left the usage out does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnreadableUsage {
     /// `input_tokens` or `output_tokens` that is not a whole number from 0
     /// to `u64::MAX` (negative, fractional, a string, past the range).
     Tokens(&'static str),
+    /// `input_tokens` or `output_tokens` left out or null, or an answer that
+    /// is not an object at all. The answer is not recorded, so the caps
+    /// count nothing of the step, as for a parsed answer that leaves the
+    /// count out ([`ModelResult::tokens`]).
+    TokensMissing(&'static str),
     /// `cost_usd` that is not a number, or `cost_currency` that is not text.
     Cost(&'static str),
 }
@@ -270,21 +275,30 @@ impl UnreadableUsage {
     /// The field, as the answer and the log name it. Never the value sent.
     pub fn field(self) -> &'static str {
         match self {
-            Self::Tokens(field) | Self::Cost(field) => field,
+            Self::Tokens(field) | Self::TokensMissing(field) | Self::Cost(field) => field,
         }
     }
 }
 
 /// The first usage field of `raw`, a `model_result` that did not parse,
-/// that no cap can count, or `None`. A field left out or null is not read
-/// here: [`ModelResult::tokens`] and the cost rule decide those once the
-/// answer parses.
+/// that no cap can count, or `None`: a token count of the wrong type, then
+/// one left out or null (the answer reports no counts the caps could use),
+/// then a cost of the wrong type. A cost left out or null is not read here:
+/// the cost rule decides that once the answer parses.
 pub fn unreadable_usage(raw: &Value) -> Option<UnreadableUsage> {
-    let answer = raw.as_object()?;
+    const COUNTS: [&str; 2] = ["input_tokens", "output_tokens"];
+    let Some(answer) = raw.as_object() else {
+        return Some(UnreadableUsage::TokensMissing(COUNTS[0]));
+    };
     let sent = |field: &str| answer.get(field).filter(|v| !v.is_null());
-    for field in ["input_tokens", "output_tokens"] {
+    for field in COUNTS {
         if sent(field).is_some_and(|v| v.as_u64().is_none()) {
             return Some(UnreadableUsage::Tokens(field));
+        }
+    }
+    for field in COUNTS {
+        if sent(field).is_none() {
+            return Some(UnreadableUsage::TokensMissing(field));
         }
     }
     if sent("cost_usd").is_some_and(|v| !v.is_number()) {
@@ -321,12 +335,17 @@ pub fn offered_tools(kind: &NodeKind) -> Vec<&str> {
 mod tests {
     use super::*;
 
-    /// A token count or a cost of the wrong type is named by its field; a
-    /// field left out, null or of the right type is not.
+    /// A token count or a cost of the wrong type is named by its field, and
+    /// so is a token count left out or null (an answer that is not an object
+    /// has none); a cost left out or null, or one of the right type, is not.
     #[test]
     fn usage_no_cap_can_count_is_named_by_its_field() {
+        // An answer that reports both counts, with `field` set to `value`.
         let with = |field: &str, value: Value| {
-            let mut answer = json!({ "content": "", "finish_reason": "stop", "model": "m" });
+            let mut answer = json!({
+                "content": "", "finish_reason": "stop", "model": "m",
+                "input_tokens": 1, "output_tokens": 2
+            });
             answer[field] = value;
             unreadable_usage(&answer)
         };
@@ -358,7 +377,6 @@ mod tests {
         );
         for (field, value) in [
             ("input_tokens", json!(0)),
-            ("input_tokens", Value::Null),
             ("output_tokens", json!(u64::MAX)),
             ("cost_usd", json!(-1.0)),
             ("cost_usd", Value::Null),
@@ -367,8 +385,42 @@ mod tests {
         ] {
             assert_eq!(with(field, value.clone()), None, "{field}: {value}");
         }
-        assert_eq!(unreadable_usage(&json!([{ "input_tokens": -5 }])), None);
-        assert_eq!(unreadable_usage(&Value::Null), None);
+        // Counts left out or null are named, the first one missing, and
+        // before a cost that does not parse.
+        for field in ["input_tokens", "output_tokens"] {
+            assert_eq!(
+                with(field, Value::Null),
+                Some(UnreadableUsage::TokensMissing(field)),
+                "{field}: null"
+            );
+            let mut answer = json!({ "content": 7, "input_tokens": 1, "output_tokens": 2 });
+            answer.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                unreadable_usage(&answer),
+                Some(UnreadableUsage::TokensMissing(field)),
+                "{field}: left out"
+            );
+        }
+        assert_eq!(
+            unreadable_usage(&json!({ "cost_usd": "0.0031" })),
+            Some(UnreadableUsage::TokensMissing("input_tokens"))
+        );
+        assert_eq!(
+            unreadable_usage(&json!({ "input_tokens": "1", "cost_usd": "0.1" })),
+            Some(UnreadableUsage::Tokens("input_tokens"))
+        );
+        // An answer that is not an object reports no counts.
+        for raw in [json!([{ "input_tokens": 5, "output_tokens": 5 }]), json!(3)] {
+            assert_eq!(
+                unreadable_usage(&raw),
+                Some(UnreadableUsage::TokensMissing("input_tokens")),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            UnreadableUsage::TokensMissing("output_tokens").field(),
+            "output_tokens"
+        );
     }
     use jamjet_ir::workflow::TokenBudgetIr;
     use jamjet_state::Event;

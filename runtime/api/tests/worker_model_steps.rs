@@ -3423,6 +3423,109 @@ async fn usage_that_does_not_parse_under_a_cap_fails_the_step_for_good() {
     }
 }
 
+/// Under a cap, an answer that does not parse and leaves out a token count
+/// is the same as a parsed one that leaves it out: the step may have paid
+/// and its spend cannot be counted, so the step fails for good (422, and
+/// the answer says so). A token cap fails it even when the field that does
+/// not parse is the cost, which that cap does not read, because the counts
+/// are missing as well. Without a cap it stays a plain 422
+/// (`an_answer_of_the_wrong_shape_is_422`). An answer that does not parse
+/// and still reports both counts is a plain 422 under a token cap.
+#[tokio::test]
+async fn an_answer_that_does_not_parse_and_leaves_out_its_tokens_fails_the_step_under_a_cap() {
+    let dollar = json!({ "cost_budget_usd": 1.0 });
+    let tokens = json!({ "token_budget": { "total_tokens": 1000 } });
+    let no_input = {
+        let mut a = answer_without(&["input_tokens"]);
+        a["content"] = json!(7);
+        a
+    };
+    let no_output = {
+        let mut a = answer_without(&["output_tokens"]);
+        a["tool_calls"] = json!([{ "id": "c1", "arguments": {} }]);
+        a
+    };
+    let neither_and_a_cost_as_a_string = {
+        let mut a = answer_without(&["input_tokens", "output_tokens"]);
+        a["cost_usd"] = json!("0.0031");
+        a
+    };
+    let null_counts_and_no_model = {
+        let mut a = answer_without(&["model"]);
+        a["input_tokens"] = Value::Null;
+        a["output_tokens"] = Value::Null;
+        a
+    };
+    let cases = [
+        ("no input tokens, content that is not text", no_input),
+        ("no output tokens, a call with no name", no_output),
+        (
+            "no tokens, a cost as a string",
+            neither_and_a_cost_as_a_string,
+        ),
+        ("null tokens, no model", null_counts_and_no_model),
+        ("an answer that is a list", json!([answer()])),
+    ];
+    for (cap, caps) in [("a dollar cap", &dollar), ("a token cap", &tokens)] {
+        for (what, model_result) in &cases {
+            for tb in support::backends().await {
+                let run = start(
+                    tb,
+                    one_step("wf-unparsed-no-tokens", &["search"], caps.clone()),
+                )
+                .await;
+                let name = run.name;
+                let wi = run.step().await;
+                let (st, body) = run
+                    .complete(&wi, result_of(&wi, model_result.clone()))
+                    .await;
+                assert_eq!(st, 422, "{name}, {cap}, {what}: {body}");
+                assert!(
+                    run.completions("think").await.is_empty(),
+                    "{name}, {cap}, {what}"
+                );
+                assert!(
+                    body["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.ends_with("so the step failed")),
+                    "{name}, {cap}, {what}: {body}"
+                );
+                assert!(
+                    run.failed_for_good("think").await.is_some(),
+                    "{name}, {cap}, {what}: {:?}",
+                    run.log().await
+                );
+                let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+                assert_eq!(st, 409, "{name}, {cap}, {what}: sent again: {body}");
+                run.tick().await;
+                assert_eq!(
+                    run.status().await,
+                    WorkflowStatus::Failed,
+                    "{name}, {cap}, {what}"
+                );
+            }
+        }
+    }
+    // Counts that are there, with another field that does not parse: a token
+    // cap reads the counts and not the rest, so the step is retried.
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            one_step("wf-unparsed-with-tokens", &["search"], tokens.clone()),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.step().await;
+        let before = run.events().await.len();
+        let (st, body) = run
+            .complete(&wi, result_of(&wi, answer_with("content", json!(7))))
+            .await;
+        assert_eq!(st, 422, "{name}: {body}");
+        run.unchanged(&wi, before, "an answer with its counts and a bad field")
+            .await;
+    }
+}
+
 // ── A lease that ran out ─────────────────────────────────────────────────────
 
 /// An answer sent after the step's lease ran out is a 409 and records
