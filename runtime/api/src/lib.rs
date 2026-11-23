@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod cron;
+pub mod driver;
 pub mod error;
 pub mod features;
 pub mod mcp_bridge;

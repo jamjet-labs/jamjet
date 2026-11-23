@@ -319,6 +319,15 @@ impl Scheduler {
     /// write as its settle, so the sweep appends nothing itself, and an item
     /// of a finished run is settled with nothing recorded.
     async fn reclaim_expired_leases(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reclaim_once().await.map(|_| ())
+    }
+
+    /// One sweep of lapsed leases, and how many items it put back for a
+    /// retry and how many it gave up on. What [`tick`](Self::tick) does first,
+    /// for a caller that drives the engine itself and wants the counts.
+    pub async fn reclaim_once(
+        &self,
+    ) -> Result<Reclaimed, Box<dyn std::error::Error + Send + Sync>> {
         let reclaimed = self.backend.reclaim_expired_leases_recorded().await?;
 
         for item in &reclaimed.retryable {
@@ -339,7 +348,10 @@ impl Scheduler {
             );
         }
 
-        Ok(())
+        Ok(Reclaimed {
+            retried: reclaimed.retryable.len(),
+            dead_lettered: reclaimed.exhausted.len(),
+        })
     }
 
     /// The workflow IR, from a cache keyed by (workflow_id, version).
@@ -393,18 +405,84 @@ impl Scheduler {
             warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
             return Ok(());
         };
+        self.passes(execution_id, &ir, workflow_id, workflow_version)
+            .await
+            .map(|_| ())
+    }
+
+    /// Up to [`PASS_TRIES`] passes for one run: the first, and another after
+    /// each one the store refused as stale. What the one that was written
+    /// dispatched is in the report, and the refused ones are counted in it and
+    /// in [`stale_passes`](Self::stale_passes).
+    async fn passes(
+        &self,
+        execution_id: &ExecutionId,
+        ir: &WorkflowIr,
+        workflow_id: &str,
+        workflow_version: &str,
+    ) -> Result<PassReport, Box<dyn std::error::Error + Send + Sync>> {
+        let mut report = PassReport::default();
         for _ in 0..PASS_TRIES {
-            if self
-                .schedule_pass(execution_id, &ir, workflow_id, workflow_version)
+            match self
+                .schedule_pass(execution_id, ir, workflow_id, workflow_version)
                 .await?
-                == PassEnd::Done
             {
-                return Ok(());
+                PassEnd::Done(done) => {
+                    report.dispatched = done.dispatched;
+                    report.terminal = done.terminal;
+                    return Ok(report);
+                }
+                PassEnd::Stale => {
+                    self.stale_passes.fetch_add(1, Ordering::Relaxed);
+                    report.stale += 1;
+                    debug!(execution_id = %execution_id, "scheduler pass was stale");
+                }
             }
-            self.stale_passes.fetch_add(1, Ordering::Relaxed);
-            debug!(execution_id = %execution_id, "scheduler pass was stale");
         }
-        Ok(())
+        Ok(report)
+    }
+
+    /// One pass for one run, now, by a caller that drives the engine (the
+    /// request-driven driver): the same decisions, written the same way as a
+    /// tick's pass for that run, through
+    /// [`StateBackend::commit_scheduler_pass`], with a stale one built again
+    /// as the tick does. The report names the nodes the pass dispatched, so
+    /// the caller can run the engine's own steps itself.
+    ///
+    /// A run that already ended writes nothing and reports `terminal`. A run
+    /// the tick does not advance (not `Running`) writes nothing either.
+    pub async fn advance_one(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<PassReport, Box<dyn std::error::Error + Send + Sync>> {
+        let run = self
+            .backend
+            .get_execution(execution_id)
+            .await?
+            .ok_or_else(|| StateBackendError::NotFound(execution_id.to_string()))?;
+        if run.status.is_terminal() {
+            self.forget(execution_id);
+            return Ok(PassReport {
+                terminal: true,
+                ..PassReport::default()
+            });
+        }
+        if run.status != jamjet_core::workflow::WorkflowStatus::Running {
+            return Ok(PassReport::default());
+        }
+        let Some(ir) = self
+            .load_ir(&run.workflow_id, &run.workflow_version)
+            .await?
+        else {
+            warn!(
+                workflow_id = %run.workflow_id,
+                workflow_version = %run.workflow_version,
+                "Workflow definition not found; cannot schedule"
+            );
+            return Ok(PassReport::default());
+        };
+        self.passes(execution_id, &ir, &run.workflow_id, &run.workflow_version)
+            .await
     }
 
     /// One pass of [`schedule_runnable_nodes`](Self::schedule_runnable_nodes):
@@ -425,7 +503,7 @@ impl Scheduler {
         // visible in the run's events.
         if progress.unreadable {
             self.record_stall(execution_id, &progress).await?;
-            return Ok(PassEnd::Done);
+            return Ok(PassEnd::nothing());
         }
 
         // A run past one of its caps fails, before anything after the step
@@ -442,7 +520,7 @@ impl Scheduler {
                 Ok(usage) => usage,
                 Err(_) => {
                     self.record_stall(execution_id, &progress).await?;
-                    return Ok(PassEnd::Done);
+                    return Ok(PassEnd::nothing());
                 }
             };
             if let Some(trip) = caps::past_cap(&caps, &usage) {
@@ -460,7 +538,9 @@ impl Scheduler {
                         },
                     )),
                 };
-                return self.commit_pass(execution_id, pass, progress).await;
+                return self
+                    .commit_pass(execution_id, pass, progress, Vec::new())
+                    .await;
             }
         }
 
@@ -487,7 +567,7 @@ impl Scheduler {
                 .await
             {
                 Ok(sweep) if !sweep.expired.is_empty() || !sweep.escalated.is_empty() => {
-                    return Ok(PassEnd::Done);
+                    return Ok(PassEnd::nothing());
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -503,6 +583,9 @@ impl Scheduler {
         let seen = progress.last_sequence;
         let mut events: Vec<EventKind> = Vec::new();
         let mut work_items: Vec<WorkItem> = Vec::new();
+        // What the pass dispatches, for the report of a caller that runs
+        // some of it at once.
+        let mut dispatched: Vec<Dispatched> = Vec::new();
 
         // Fail nodes whose approval was rejected. Guarded by terminal_failed so
         // the emission fires exactly once: the next tick folds the NodeFailed,
@@ -730,6 +813,11 @@ impl Scheduler {
                     node_id: node_id.clone(),
                     queue_type: queue_type.clone(),
                 });
+                dispatched.push(Dispatched {
+                    node_id: node_id.to_string(),
+                    kind: kind_tag(&node.kind),
+                    queue: queue_type.clone(),
+                });
 
                 // Attempt budget from the node's named retry policy (Phase 2: full policy resolution).
                 let max_attempts = crate::payload::max_attempts_for(node.retry_policy.as_deref());
@@ -797,9 +885,10 @@ impl Scheduler {
         };
         if pass.is_empty() {
             // Nothing to record, and the cache already holds this fold.
-            return Ok(PassEnd::Done);
+            return Ok(PassEnd::nothing());
         }
-        self.commit_pass(execution_id, pass, progress).await
+        self.commit_pass(execution_id, pass, progress, dispatched)
+            .await
     }
 
     /// Fold the events appended since the last pass into the run's cached
@@ -910,18 +999,22 @@ impl Scheduler {
 
     /// Write `pass`, folded from `progress`, and keep the run's cached
     /// progress in step with what the store holds.
+    ///
+    /// `dispatched` names the nodes whose items `pass` holds; it comes back
+    /// in the end only when the pass was written.
     async fn commit_pass(
         &self,
         execution_id: &ExecutionId,
         pass: SchedulerPass,
         progress: ExecProgress,
+        dispatched: Vec<Dispatched>,
     ) -> Result<PassEnd, Box<dyn std::error::Error + Send + Sync>> {
         let recorded = pass.events.clone();
-        let dispatched = pass.work_items.len();
+        let dispatched_items = pass.work_items.len();
         let finished = pass.finish.as_ref().map(|(status, _)| status.clone());
         match self.backend.commit_scheduler_pass(pass).await {
             Ok(PassCommit::Committed { .. }) => {
-                if dispatched > 0 {
+                if dispatched_items > 0 {
                     if let Err(e) = after_dispatch_commit().await {
                         // The next tick folds the whole log again.
                         self.progress.lock().unwrap().remove(execution_id);
@@ -929,9 +1022,10 @@ impl Scheduler {
                     }
                 }
                 log_recorded(execution_id, &recorded);
-                if dispatched > 0 {
-                    debug!(execution_id = %execution_id, dispatched, "Dispatch complete");
+                if dispatched_items > 0 {
+                    debug!(execution_id = %execution_id, dispatched = dispatched_items, "Dispatch complete");
                 }
+                let terminal = finished.is_some();
                 match finished {
                     Some(status) => {
                         info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
@@ -949,7 +1043,10 @@ impl Scheduler {
                             .insert(execution_id.clone(), progress);
                     }
                 }
-                Ok(PassEnd::Done)
+                Ok(PassEnd::Done(PassDone {
+                    dispatched,
+                    terminal,
+                }))
             }
             Ok(PassCommit::Stale { .. }) => {
                 // The next try folds the whole log again.
@@ -961,7 +1058,10 @@ impl Scheduler {
                 // nothing is appended after `WorkflowCancelled`.
                 debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
                 self.forget(execution_id);
-                Ok(PassEnd::Done)
+                Ok(PassEnd::Done(PassDone {
+                    dispatched: Vec::new(),
+                    terminal: true,
+                }))
             }
             Err(e) => {
                 // The next tick folds the whole log again.
@@ -978,13 +1078,71 @@ impl Scheduler {
     }
 }
 
-/// How one pass of [`Scheduler::schedule_runnable_nodes`] ended.
+/// How one pass of [`Scheduler::passes`] ended.
 #[derive(Debug, PartialEq, Eq)]
 enum PassEnd {
     /// The pass was written, had nothing to write, or found the run finished.
-    Done,
+    Done(PassDone),
     /// The store refused the pass as stale and wrote none of it.
     Stale,
+}
+
+impl PassEnd {
+    /// A pass that wrote nothing and found the run still going.
+    fn nothing() -> Self {
+        PassEnd::Done(PassDone::default())
+    }
+}
+
+/// What a pass that was not refused left behind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PassDone {
+    /// The nodes it dispatched.
+    dispatched: Vec<Dispatched>,
+    /// It finished the run, or found it already finished.
+    terminal: bool,
+}
+
+/// What [`Scheduler::advance_one`] did for one run.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    /// The nodes the written pass dispatched, each with an item on its queue.
+    pub dispatched: Vec<Dispatched>,
+    /// The run is finished: this pass finished it, or it had ended already.
+    pub terminal: bool,
+    /// How many passes the store refused as stale and the scheduler built
+    /// again, before the one that was written.
+    pub stale: u32,
+}
+
+/// One node a pass dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatched {
+    pub node_id: String,
+    /// The node's kind, as the policy and the worker pool name it
+    /// (`condition`, `human_approval`, `python_fn`, `model`, ...).
+    pub kind: String,
+    /// The queue its item is on.
+    pub queue: String,
+}
+
+/// What [`Scheduler::reclaim_once`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// Items whose lease had lapsed, put back for another attempt.
+    pub retried: usize,
+    /// Items that had used every attempt, moved to the dead-letter queue.
+    pub dead_lettered: usize,
+}
+
+/// The tag a node kind goes by in the worker pool and the policy: the
+/// `type` of its serialized form (the same as
+/// `jamjet_policy::engine::node_kind_tag`, which this crate does not link).
+fn kind_tag(kind: &NodeKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The seam after a pass that dispatched work has committed, before the
@@ -3945,5 +4103,254 @@ mod tests {
                 "{n} must be skipped on replay (null route)"
             );
         }
+    }
+    // ── advance_one and reclaim_once: the driver's one-run pass ────────────────
+
+    fn dispatched(node_id: &str, kind: &str, queue: &str) -> Dispatched {
+        Dispatched {
+            node_id: node_id.into(),
+            kind: kind.into(),
+            queue: queue.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_one_names_what_the_pass_dispatched() {
+        let (s, b, e) = setup(linear_ir()).await;
+
+        let first = s.advance_one(&e).await.unwrap();
+        assert_eq!(
+            first.dispatched,
+            vec![dispatched("a", "condition", "general")]
+        );
+        assert!(!first.terminal);
+        assert_eq!(first.stale, 0);
+
+        // Nothing new: the same node is not dispatched twice.
+        let again = s.advance_one(&e).await.unwrap();
+        assert_eq!(again, PassReport::default());
+
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+        let next = s.advance_one(&e).await.unwrap();
+        assert_eq!(
+            next.dispatched,
+            vec![dispatched("b", "condition", "general")]
+        );
+        assert_eq!(
+            scheduled_nodes(&b.get_events(&e).await.unwrap()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// Every kind is reported by the tag the worker pool and the policy use,
+    /// with the queue its item is on.
+    #[tokio::test]
+    async fn advance_one_reports_each_kind_and_queue() {
+        let node = |id: &str, kind: serde_json::Value| {
+            serde_json::json!({
+                "id": id, "kind": kind, "retry_policy": null, "node_timeout_secs": null,
+                "description": null, "labels": {}
+            })
+        };
+        let ir = build_ir(
+            "a",
+            serde_json::json!({
+                "a": cond_node("a", serde_json::json!([])),
+                "py": node("py", serde_json::json!({
+                    "type": "python_fn", "module": "m", "function": "f", "output_schema": ""
+                })),
+                "human": node("human", serde_json::json!({
+                    "type": "human_approval", "description": "ok?", "timeout_secs": null,
+                    "fallback_node": null
+                })),
+            }),
+            serde_json::json!([
+                { "from": "a", "to": "py", "condition": null },
+                { "from": "a", "to": "human", "condition": null },
+                { "from": "py", "to": "end", "condition": null },
+                { "from": "human", "to": "end", "condition": null }
+            ]),
+        );
+        let (s, b, e) = setup(ir).await;
+        s.advance_one(&e).await.unwrap();
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+
+        let mut fan = s.advance_one(&e).await.unwrap().dispatched;
+        fan.sort_by(|x, y| x.node_id.cmp(&y.node_id));
+
+        assert_eq!(
+            fan,
+            vec![
+                dispatched("human", "human_approval", "general"),
+                dispatched("py", "python_fn", "python_tool"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_one_reports_the_pass_that_finishes_the_run_as_terminal() {
+        let (s, b, e) = setup(linear_ir()).await;
+        s.advance_one(&e).await.unwrap();
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+        s.advance_one(&e).await.unwrap();
+        append(&b, &e, node_completed("b", serde_json::json!({}))).await;
+
+        let last = s.advance_one(&e).await.unwrap();
+
+        assert!(last.terminal);
+        assert!(last.dispatched.is_empty());
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn advance_one_on_a_finished_run_writes_nothing() {
+        let (s, b, e) = setup(linear_ir()).await;
+        s.advance_one(&e).await.unwrap();
+        b.update_execution_status(&e, WorkflowStatus::Cancelled)
+            .await
+            .unwrap();
+        let before = b.get_events(&e).await.unwrap().len();
+
+        let report = s.advance_one(&e).await.unwrap();
+
+        assert_eq!(
+            report,
+            PassReport {
+                dispatched: vec![],
+                terminal: true,
+                stale: 0
+            }
+        );
+        assert_eq!(b.get_events(&e).await.unwrap().len(), before);
+        assert!(
+            s.progress.lock().unwrap().get(&e).is_none(),
+            "what the scheduler kept for the run is dropped"
+        );
+    }
+
+    /// The tick lists `Running` runs only; so does an advance.
+    #[tokio::test]
+    async fn advance_one_leaves_a_run_that_is_not_running_alone() {
+        let (s, b, e) = setup(linear_ir()).await;
+        b.update_execution_status(&e, WorkflowStatus::Paused)
+            .await
+            .unwrap();
+
+        let report = s.advance_one(&e).await.unwrap();
+
+        assert_eq!(report, PassReport::default());
+        assert!(b.get_events(&e).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn advance_one_on_a_run_that_does_not_exist_is_an_error() {
+        let (s, _b, _e) = setup(linear_ir()).await;
+        let missing = ExecutionId::new();
+        let err = s.advance_one(&missing).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// A pass the store refuses as stale is built again from the log, and
+    /// said so in the report and in the scheduler's own count.
+    #[tokio::test]
+    async fn advance_one_builds_a_stale_pass_again_and_says_so() {
+        let (s, b, e) = setup(linear_ir()).await;
+        s.advance_one(&e).await.unwrap(); // dispatches `a`
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+        s.progress
+            .lock()
+            .unwrap()
+            .get_mut(&e)
+            .expect("a running run is cached")
+            .last_sequence += 10;
+
+        let report = s.advance_one(&e).await.unwrap();
+
+        assert_eq!(report.stale, 1);
+        assert_eq!(
+            report.dispatched,
+            vec![dispatched("b", "condition", "general")]
+        );
+        assert_eq!(s.stale_passes(), 1);
+        assert_eq!(
+            scheduled_nodes(&b.get_events(&e).await.unwrap()),
+            vec!["a".to_string(), "b".to_string()],
+            "`b` once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_once_counts_what_it_put_back_and_what_it_gave_up() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = chrono::Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        for (node, max_attempts) in [("retry_a", 3), ("retry_b", 3), ("last_try", 1)] {
+            backend
+                .enqueue_work_item(jamjet_state::backend::WorkItem {
+                    id: Uuid::new_v4(),
+                    execution_id: eid.clone(),
+                    node_id: node.into(),
+                    queue_type: "general".into(),
+                    payload: serde_json::json!({}),
+                    attempt: 0,
+                    max_attempts,
+                    created_at: now,
+                    lease_expires_at: None,
+                    worker_id: None,
+                    lease_fence: 0,
+                    tenant_id: DEFAULT_TENANT.into(),
+                })
+                .await
+                .unwrap();
+            held.push(
+                backend
+                    .claim_work_item_filtered(
+                        "crashed",
+                        &["general"],
+                        None,
+                        &jamjet_state::ClaimFilter {
+                            execution_id: Some(eid.clone()),
+                            node_id: Some(node.into()),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .expect("claimable"),
+            );
+        }
+        for item in &held {
+            backend.force_lease_expired_for_test(item.id);
+        }
+        let s = Scheduler::new(backend.clone());
+
+        let first = s.reclaim_once().await.unwrap();
+        let second = s.reclaim_once().await.unwrap();
+
+        assert_eq!(
+            first,
+            Reclaimed {
+                retried: 2,
+                dead_lettered: 1
+            }
+        );
+        assert_eq!(second, Reclaimed::default(), "nothing is reclaimed twice");
     }
 }

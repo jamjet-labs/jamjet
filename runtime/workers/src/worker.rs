@@ -1263,6 +1263,43 @@ impl Worker {
             .ok_or_else(|| format!("workflow {workflow_id} v{workflow_version} not found"))?;
         serde_json::from_value(def.ir).map_err(|e| e.to_string())
     }
+
+    // ── Request-driven mode ───────────────────────────────────────────────────
+
+    /// Claim the item `filter` names and run it, as
+    /// [`poll_and_execute`](Self::poll_and_execute) runs the oldest one: the
+    /// driver runs one engine step inside a request this way. `Ok(None)` when
+    /// no pending item matched, with nothing written.
+    ///
+    /// A claim that names an execution leases the item already marked as
+    /// gating (`GateMark::Gating`), for the HTTP claim route to read. This
+    /// path never does: the policy, approval and cap gate runs inside
+    /// `execute_item` (`check_policy`), on the log, so the mark decides
+    /// nothing here and the next lease of the item starts unmarked.
+    #[instrument(skip(self, filter), fields(worker_id = %self.worker_id))]
+    pub async fn run_item_for(
+        &self,
+        filter: &jamjet_state::ClaimFilter,
+    ) -> Result<Option<()>, Box<dyn std::error::Error + Send + Sync>> {
+        let queue_refs: Vec<&str> = self.queue_types.iter().map(|s| s.as_str()).collect();
+        let item = self
+            .backend
+            .claim_work_item_filtered(&self.worker_id, &queue_refs, None, filter)
+            .await?;
+        let Some(item) = item else { return Ok(None) };
+        info!(
+            worker_id = %self.worker_id,
+            execution_id = %item.execution_id,
+            node_id = %item.node_id,
+            attempt = item.attempt,
+            "Claimed work item for one run"
+        );
+        let done = self.execute_item(item).await;
+        self.finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        done?;
+        Ok(Some(()))
+    }
 }
 
 /// How long a node's executor may run: the node's `node_timeout_secs`, else
@@ -5527,5 +5564,153 @@ mod tests {
         assert_eq!(fired, 0);
         assert_eq!(requests, 0, "no request without a digest");
         assert!(errored);
+    }
+
+    // ── run_item_for: one named item, run by the engine inside a request ──────
+
+    fn only(eid: &ExecutionId, node: &str) -> jamjet_state::ClaimFilter {
+        jamjet_state::ClaimFilter {
+            execution_id: Some(eid.clone()),
+            node_id: Some(node.to_string()),
+        }
+    }
+
+    /// The nodes of `eid` that recorded a `NodeCompleted`, in order.
+    async fn completed_nodes(backend: &Arc<InMemoryBackend>, eid: &ExecutionId) -> Vec<String> {
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::NodeCompleted { node_id, .. } => Some(node_id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A second run of the same workflow, with its own `n1` item pending.
+    async fn second_run(backend: &Arc<InMemoryBackend>) -> ExecutionId {
+        let other = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&other))
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(sample_item(&other))
+            .await
+            .unwrap();
+        other
+    }
+
+    #[tokio::test]
+    async fn run_item_for_runs_the_named_item_and_no_other() {
+        // Eight runs, each with its own `n1` pending. The memory store
+        // claims in no particular order, so a claim that ignored the run
+        // named would take another one almost every time.
+        let (backend, first) = setup_backend().await;
+        let mut runs = vec![first];
+        for _ in 0..7 {
+            runs.push(second_run(&backend).await);
+        }
+        let worker = Worker::new(
+            "engine-test".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(NoopExecutor));
+
+        // Newest first, one at a time: after each call exactly the runs
+        // named so far have completed `n1`.
+        for (done, run) in runs.iter().rev().enumerate() {
+            assert_eq!(
+                worker.run_item_for(&only(run, "n1")).await.unwrap(),
+                Some(())
+            );
+            for (i, other) in runs.iter().rev().enumerate() {
+                let expected: Vec<String> = if i <= done { vec!["n1".into()] } else { vec![] };
+                assert_eq!(
+                    completed_nodes(&backend, other).await,
+                    expected,
+                    "after naming {done} runs, run {i} (newest first)"
+                );
+            }
+            // The named item is settled: naming it again finds nothing.
+            assert_eq!(worker.run_item_for(&only(run, "n1")).await.unwrap(), None);
+        }
+        assert!(
+            backend
+                .claim_work_item("probe", &["default"])
+                .await
+                .unwrap()
+                .is_none(),
+            "every item was run"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_item_for_with_no_matching_item_writes_nothing() {
+        let (backend, a) = setup_backend().await;
+        let worker = make_worker(backend.clone()).register_executor("tool", Arc::new(NoopExecutor));
+        let before = backend.get_events(&a).await.unwrap().len();
+
+        let ran = worker.run_item_for(&only(&a, "elsewhere")).await.unwrap();
+
+        assert_eq!(ran, None);
+        assert_eq!(backend.get_events(&a).await.unwrap().len(), before);
+        assert_eq!(worker.items_finished(), 0, "nothing was taken to the end");
+        assert!(
+            backend
+                .claim_work_item("probe", &["default"])
+                .await
+                .unwrap()
+                .is_some(),
+            "the item is still pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_item_for_counts_the_item_it_finished() {
+        let (backend, a) = setup_backend().await;
+        let worker = make_worker(backend.clone()).register_executor("tool", Arc::new(NoopExecutor));
+        worker.run_item_for(&only(&a, "n1")).await.unwrap();
+        assert_eq!(worker.items_finished(), 1);
+    }
+
+    /// A node held for approval is raised once, and fires once when the
+    /// approval for exactly that action is there. The filtered claim leaves
+    /// the claim gate's mark on the item (`GateMark::Gating`); only the HTTP
+    /// claim route reads it, and this path does not, so the second step is
+    /// decided on the approval and nothing else.
+    #[tokio::test]
+    async fn run_item_for_holds_a_gated_node_once_and_fires_it_once_when_approved() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        assert_eq!(
+            worker.run_item_for(&only(&eid, "n1")).await.unwrap(),
+            Some(())
+        );
+        let digests = request_digests(&backend, &eid).await;
+        assert_eq!(digests.len(), 1, "one request");
+        assert_eq!(fired(&exec), 0, "held, not fired");
+
+        append(
+            &backend,
+            &eid,
+            approval(Some(digests[0].as_deref().expect("a digest"))),
+        )
+        .await;
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        assert_eq!(
+            worker.run_item_for(&only(&eid, "n1")).await.unwrap(),
+            Some(())
+        );
+
+        assert_eq!(fired(&exec), 1, "fired once, on the approval");
+        assert_eq!(
+            request_digests(&backend, &eid).await.len(),
+            1,
+            "no re-request"
+        );
     }
 }
