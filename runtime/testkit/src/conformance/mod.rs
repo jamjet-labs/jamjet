@@ -451,6 +451,15 @@ macro_rules! for_each_case {
         );
         $m!(
             $factory,
+            ticks,
+            [
+                a_fresh_store_begins_and_a_held_lease_is_busy,
+                finish_needs_the_lease_and_stores_the_outcome,
+                two_handles_begin_at_once_one_wins,
+            ]
+        );
+        $m!(
+            $factory,
             faults,
             [
                 an_error_at_any_step_leaves_no_partial_write,

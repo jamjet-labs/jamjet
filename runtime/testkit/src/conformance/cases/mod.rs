@@ -7,8 +7,9 @@
 //! `payloads`, `terminal` and `tenancy` are written for the suite: what two
 //! engines on one store, large or unusual values, a finished run and a
 //! tenant's scope must do on every backend. `run_keys` checks that a run
-//! key names one run, in its tenant only. `faults` stops each of the
-//! store's transactions between two statements.
+//! key names one run, in its tenant only. `ticks` checks the one tick
+//! lease a store keeps for engines run with their loops off. `faults` stops
+//! each of the store's transactions between two statements.
 
 pub mod api_token_hash;
 pub mod append_event_if;
@@ -37,4 +38,5 @@ pub mod support;
 pub mod tenancy;
 pub mod tenant_isolation;
 pub mod terminal;
+pub mod ticks;
 pub mod workflow_immutability;

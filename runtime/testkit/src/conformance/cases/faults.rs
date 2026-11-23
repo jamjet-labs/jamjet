@@ -29,7 +29,8 @@ use jamjet_state::faults::{self, Fault, Scope, POINTS};
 use jamjet_state::{
     ApprovalProjectionRow, BackendResult, ConditionalAppend, Event, EventKind, ExecutionFinish,
     FailOutcome, KeyedStart, PassCommit, RunKeyClaim, SchedulerPass, Snapshot, StateBackend,
-    StateBackendError, TurnCommit, WorkItem, DEFAULT_TENANT, MAX_LEASE_SECS,
+    StateBackendError, TickBegin, TickOutcome, TurnCommit, WorkItem, DEFAULT_TENANT,
+    MAX_LEASE_SECS,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -71,7 +72,9 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
         | "pg.finalize_rollover_fenced"
         | "pg.reclaim_expired_leases_recorded"
         | "pg.commit_turn"
-        | "pg.apply_approval_projection" => POSTGRES,
+        | "pg.apply_approval_projection"
+        | "pg.begin_tick"
+        | "pg.finish_tick" => POSTGRES,
         "sqlite.commit_turn"
         | "sqlite.append_event"
         | "sqlite.claim_work_item"
@@ -94,7 +97,9 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
         | "sqlite.commit_scheduler_pass"
         | "sqlite.reclaim_expired_leases_recorded"
         | "sqlite.fail_work_item_fenced_recorded"
-        | "sqlite.patch_append_array" => BOTH,
+        | "sqlite.patch_append_array"
+        | "sqlite.begin_tick"
+        | "sqlite.finish_tick" => BOTH,
         _ => return None,
     })
 }
@@ -714,7 +719,67 @@ async fn prepare(fx: &Fixture, operation: &str, at: At) -> Call {
                 lands: &[("workflow_executions", 1, 1)],
             }
         }
+        "begin_tick" => {
+            free_tick(&b).await;
+            Call {
+                run: call(move || {
+                    let b = b.clone();
+                    async move {
+                        let begun = b.begin_tick("faults-tick", TICK_LEASE).await?;
+                        assert!(matches!(begun, TickBegin::Began { .. }), "{begun:?}");
+                        Ok(())
+                    }
+                }),
+                lands: &[("engine_ticks", 1, 1)],
+            }
+        }
+        "finish_tick" => {
+            free_tick(&b).await;
+            let begun = b.begin_tick("faults-tick", TICK_LEASE).await.unwrap();
+            assert!(matches!(begun, TickBegin::Began { .. }), "{begun:?}");
+            Call {
+                run: call(move || {
+                    let b = b.clone();
+                    async move {
+                        let outcome = TickOutcome {
+                            cursor: Some("run-1".into()),
+                            complete: false,
+                            report: json!({ "visited": 1 }),
+                        };
+                        let finished = b.finish_tick("faults-tick", &outcome).await?;
+                        assert!(finished, "the holder could not finish");
+                        Ok(())
+                    }
+                }),
+                lands: &[("engine_ticks", 1, 1)],
+            }
+        }
         other => panic!("no operation in the faults case for {other}"),
+    }
+}
+
+/// The lease every tick call in this module takes.
+const TICK_LEASE: Duration = Duration::from_secs(60);
+
+/// Leave the store with a tick row and no holder: the row made by a tick
+/// that began and finished, and any lease an earlier call left given back.
+async fn free_tick(b: &Arc<dyn StateBackend>) {
+    let done = TickOutcome {
+        cursor: None,
+        complete: true,
+        report: json!({}),
+    };
+    match b.tick_status().await.unwrap() {
+        None => {
+            let begun = b.begin_tick("faults-setup", TICK_LEASE).await.unwrap();
+            assert!(matches!(begun, TickBegin::Began { .. }), "{begun:?}");
+            assert!(b.finish_tick("faults-setup", &done).await.unwrap());
+        }
+        Some(row) => {
+            if let Some(holder) = row.holder {
+                assert!(b.finish_tick(&holder, &done).await.unwrap());
+            }
+        }
     }
 }
 

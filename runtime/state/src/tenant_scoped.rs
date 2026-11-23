@@ -2665,6 +2665,31 @@ impl StateBackend for TenantScopedSqliteBackend {
         )
         .await
     }
+
+    // ── Request-driven mode ───────────────────────────────────────────────
+    //
+    // The tick row is the store's, not a tenant's: this view takes and reads
+    // the lease the unscoped store does, on the shared pool.
+
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<crate::backend::TickBegin> {
+        crate::sqlite::begin_tick_in(&self.pool, holder, lease).await
+    }
+
+    async fn finish_tick(
+        &self,
+        holder: &str,
+        outcome: &crate::backend::TickOutcome,
+    ) -> BackendResult<bool> {
+        crate::sqlite::finish_tick_in(&self.pool, holder, outcome).await
+    }
+
+    async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
+        crate::sqlite::tick_status_in(&self.pool).await
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.

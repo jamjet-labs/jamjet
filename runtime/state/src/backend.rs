@@ -1293,6 +1293,43 @@ pub trait StateBackend: Send + Sync {
     async fn store_now(&self) -> BackendResult<chrono::DateTime<chrono::Utc>> {
         Ok(crate::clock::process_now())
     }
+
+    // ── Request-driven mode ──────────────────────────────────────────────
+
+    /// Take the tick lease for `holder` until `lease` from now by the
+    /// store's clock, when no one holds it or its holder's lease has lapsed.
+    /// [`TickBegin::Began`] carries where the last finished tick stopped.
+    /// [`TickBegin::Busy`] names the holder of a live lease, and nothing is
+    /// written.
+    ///
+    /// A store has one lease: every handle on it, scoped to a tenant or not,
+    /// takes the same one. The lease saves work, it does not make it
+    /// correct: a tick that runs past its lease still writes through the
+    /// store's conditional writes. A lease longer than [`MAX_TICK_LEASE`] is
+    /// refused. The default refuses.
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<TickBegin> {
+        let _ = (holder, lease);
+        Err(cannot_coordinate_ticks())
+    }
+
+    /// Give the tick lease back and store `outcome`, if the tick row still
+    /// names `holder`. `false`, with nothing written, when it does not: the
+    /// lease lapsed and another holder took it, `holder` never held it, or
+    /// it was given back already. The default refuses.
+    async fn finish_tick(&self, holder: &str, outcome: &TickOutcome) -> BackendResult<bool> {
+        let _ = (holder, outcome);
+        Err(cannot_coordinate_ticks())
+    }
+
+    /// The tick row as it stands, `None` until the first tick begins. The
+    /// default refuses.
+    async fn tick_status(&self) -> BackendResult<Option<TickStatus>> {
+        Err(cannot_coordinate_ticks())
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).
@@ -1589,6 +1626,76 @@ pub enum PassCommit {
     Stale { latest_sequence: EventSequence },
     /// Nothing written: the run is terminal.
     ExecutionTerminal(WorkflowStatus),
+}
+
+// ── Request-driven mode ──────────────────────────────────────────────────────
+
+/// The longest tick lease a store takes ([`StateBackend::begin_tick`]).
+pub const MAX_TICK_LEASE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// What [`StateBackend::begin_tick`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TickBegin {
+    /// The lease is the caller's now. `cursor` is where the last finished
+    /// tick stopped its walk (`None`: start from the beginning), and
+    /// `last_finished_at` when it finished (`None`: no tick has finished).
+    Began {
+        cursor: Option<String>,
+        last_finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// `holder`'s lease is live until `lease_until`, by the store's clock.
+    /// Nothing was written.
+    Busy {
+        holder: String,
+        lease_until: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// What a tick stores when it gives its lease back
+/// ([`StateBackend::finish_tick`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickOutcome {
+    /// Where the walk stopped, for the next tick to resume from. `None`
+    /// starts the next one from the beginning.
+    pub cursor: Option<String>,
+    /// Whether the tick got through its work within its budget.
+    pub complete: bool,
+    /// The tick's report, kept as it is for [`StateBackend::tick_status`].
+    pub report: serde_json::Value,
+}
+
+/// The tick row as it stands ([`StateBackend::tick_status`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TickStatus {
+    /// Who holds the lease, `None` while no tick does.
+    pub holder: Option<String>,
+    /// When the holder's lease ends, by the store's clock.
+    pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the last tick began, and when the last finished one finished.
+    pub last_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The last finished tick's outcome: whether it got through, its
+    /// report, and where it stopped.
+    pub last_complete: Option<bool>,
+    pub last_report: Option<serde_json::Value>,
+    pub cursor: Option<String>,
+}
+
+/// The refusal of a store that has no tick state.
+fn cannot_coordinate_ticks() -> StateBackendError {
+    StateBackendError::Database("this backend cannot coordinate ticks".into())
+}
+
+/// `lease` as a duration the store can add to its clock: refused past
+/// [`MAX_TICK_LEASE`], so no backend overflows its clock.
+pub(crate) fn tick_lease(lease: std::time::Duration) -> BackendResult<chrono::Duration> {
+    if lease > MAX_TICK_LEASE {
+        return Err(StateBackendError::Database(format!(
+            "a tick lease of {lease:?} is longer than the {MAX_TICK_LEASE:?} a store takes"
+        )));
+    }
+    chrono::Duration::from_std(lease)
+        .map_err(|e| StateBackendError::Database(format!("tick lease {lease:?}: {e}")))
 }
 
 #[cfg(test)]

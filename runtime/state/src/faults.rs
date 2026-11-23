@@ -123,6 +123,9 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.fail_work_item_fenced_recorded", 7),
     ("sqlite.patch_append_array", 1),
     ("sqlite.patch_append_array", 2),
+    ("sqlite.begin_tick", 1),
+    ("sqlite.begin_tick", 2),
+    ("sqlite.finish_tick", 1),
     // tenant_scoped.rs: the scoped copies of the unscoped bodies.
     ("sqlite_scoped.commit_turn", 1),
     ("sqlite_scoped.commit_turn", 2),
@@ -213,6 +216,9 @@ pub const POINTS: &[(&str, u32)] = &[
     ("pg.commit_turn", 10),
     ("pg.apply_approval_projection", 1),
     ("pg.apply_approval_projection", 2),
+    // postgres/ticks.rs: one body serves the unscoped and the scoped store.
+    ("pg.begin_tick", 1),
+    ("pg.finish_tick", 1),
     // postgres/tx.rs: seams, the start of each attempt of a transaction,
     // before its `BEGIN`, and the start of each retry.
     ("pg_tx.attempt", 1),
