@@ -307,8 +307,10 @@ attempt: report it on `POST /work-items/:id/fail` with the `lease_fence`, so
 the step is retried, rather than sending the same answer again.
 
 Under a dollar cap, an answer with no `cost_usd` is recorded with its cost
-unknown, and the run fails on the next pass with `cost_not_reported`. With no
-dollar cap, no cost is fine.
+unknown, and the run fails on the next pass with `cost_not_reported`. It is
+answered `200` and recorded, so do not send it again. A negative cost, or one
+over the ceiling, is a `400` and is not recorded. With no dollar cap, no cost
+is fine.
 
 Where the two executors still differ:
 

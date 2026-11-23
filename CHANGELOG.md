@@ -75,6 +75,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pay again with nothing recorded. Without a cap it is a plain 400. Usage that does not parse
   (a negative, fractional or string token count, a cost that is not a number) is treated the
   same way under a cap that reads it, and is a 422 without one.
+- A cost left out is not a cost that cannot be counted. Under a dollar cap, an answer that is
+  otherwise valid and sends no `cost_usd` is accepted (200) and recorded with its cost
+  unknown, and the scheduler then fails the run with `cost_not_reported`. The answer is
+  recorded, so the worker must not send it again (a second send is a 409). A negative cost,
+  or one over the ceiling, is a 400: the answer is not recorded, and under a dollar cap the
+  step fails for good.
 - An answer sent after the step's lease ran out is a 409 and records nothing, also before
   the scheduler or another claim takes the step back: the lease is read on the store's clock.
 - A long output is moved to the artifact store, as the in-process worker moves it, so both
