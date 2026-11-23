@@ -228,10 +228,26 @@ pub struct Engine {
     dir: PathBuf,
     url: String,
     env: Vec<(String, String)>,
+    /// The threads that copy the process's stdout and stderr into `log`.
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // A case that is failing says what the engine's own threads panicked
+        // on, if they did: a call that got no answer may be one of them.
+        if std::thread::panicking() {
+            for panic in self.panics() {
+                eprintln!("the engine on {} panicked: {panic}", self.addr);
+            }
+            // And the end of what it said, for a case that failed on time.
+            let log = self.log();
+            let lines: Vec<&str> = log.lines().collect();
+            for line in &lines[lines.len().saturating_sub(12)..] {
+                let said: String = line.chars().take(300).collect();
+                eprintln!("the engine on {}: {said}", self.addr);
+            }
+        }
         self.kill();
     }
 }
@@ -261,6 +277,7 @@ impl Engine {
             dir: store.dir.clone(),
             url: store.url.clone(),
             env: all,
+            readers: Vec::new(),
         };
         engine.spawn().await;
         engine
@@ -276,14 +293,14 @@ impl Engine {
             Box::new(child.stderr.take().unwrap()),
         ] {
             let log = self.log.clone();
-            std::thread::spawn(move || {
+            self.readers.push(std::thread::spawn(move || {
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
                     let mut log = log.lock().unwrap();
                     log.push_str(&line);
                     log.push('\n');
                 }
-            });
+            }));
         }
         let deadline = Instant::now() + WAIT;
         loop {
@@ -328,11 +345,60 @@ impl Engine {
         self.log.lock().unwrap().matches(needle).count()
     }
 
-    /// SIGKILL, and wait for the process to go.
+    /// What the process printed for each panic of one of its threads: the
+    /// line that says where, and the message under it. Its stdout and stderr
+    /// are read apart, so the log lines in between (JSON) are skipped.
+    pub fn panics(&self) -> Vec<String> {
+        let log = self.log.lock().unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        let mut panics = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if !line.contains("panicked at") {
+                continue;
+            }
+            let mut said = Vec::new();
+            for next in lines[at..].iter().filter(|l| !l.starts_with('{')).take(6) {
+                said.push(*next);
+                if next.starts_with("note:") {
+                    break;
+                }
+            }
+            panics.push(said.join("\n"));
+        }
+        panics
+    }
+
+    /// Fails the case, with the text of each panic, if a thread of the engine
+    /// has panicked. A thread that panics while it serves a request drops the
+    /// request, and the caller sees only that no answer came.
+    pub fn assert_no_panics(&self) {
+        let panics = self.panics();
+        assert!(
+            panics.is_empty(),
+            "the engine on {} panicked on {} thread(s):\n{}",
+            self.addr,
+            panics.len(),
+            panics.join("\n")
+        );
+    }
+
+    /// SIGKILL, and wait for the process to go. Then, unless the case is
+    /// already failing, fail it if a thread of the engine had panicked: the
+    /// last lines are read first, so a panic just before the kill is counted.
     pub fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // The readers end when the process's pipes close. Wait for them, but
+        // not for a pipe that something the process started holds open.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.readers.iter().any(|r| !r.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.readers.retain(|r| !r.is_finished());
+        if !std::thread::panicking() {
+            self.assert_no_panics();
         }
     }
 

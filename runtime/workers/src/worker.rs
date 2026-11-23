@@ -21,7 +21,7 @@ use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument, warn, Instrument};
 
 /// A JamJet worker process.
 ///
@@ -198,20 +198,11 @@ impl Worker {
         &self,
         item: WorkItem,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let start = std::time::Instant::now();
-        let execution_id = item.execution_id.clone();
-        let node_id = item.node_id.clone();
-        let tenant_id = item.tenant_id.clone();
-        let attempt = item.attempt;
-        let max_attempts = item.max_attempts;
-        let item_id = item.id;
-        let lease_fence = item.lease_fence;
-
         let node_span = tracing::info_span!(
             "jamjet.node",
-            "jamjet.execution.id" = %execution_id,
-            "jamjet.node.id" = %node_id,
-            "jamjet.attempt" = attempt,
+            "jamjet.execution.id" = %item.execution_id,
+            "jamjet.node.id" = %item.node_id,
+            "jamjet.attempt" = item.attempt,
             "jamjet.worker.id" = %self.worker_id,
             "jamjet.workflow.id" = tracing::field::Empty,
             "jamjet.workflow.version" = tracing::field::Empty,
@@ -224,7 +215,31 @@ impl Worker {
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "gen_ai.response.finish_reasons" = tracing::field::Empty,
         );
-        let _span_guard = node_span.enter();
+        // The span goes on the future, which enters it at each poll and leaves
+        // it before the poll returns. A guard held across an `.await` is
+        // entered on the thread that took the first poll and left on whichever
+        // thread takes the last, so the first thread's stack keeps a span that
+        // has closed, and the registry panics the next time that thread asks
+        // for the current span.
+        self.execute_item_in(item, node_span.clone())
+            .instrument(node_span)
+            .await
+    }
+
+    /// The body of [`execute_item`](Self::execute_item), run inside `node_span`.
+    async fn execute_item_in(
+        &self,
+        item: WorkItem,
+        node_span: tracing::Span,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let start = std::time::Instant::now();
+        let execution_id = item.execution_id.clone();
+        let node_id = item.node_id.clone();
+        let tenant_id = item.tenant_id.clone();
+        let attempt = item.attempt;
+        let max_attempts = item.max_attempts;
+        let item_id = item.id;
+        let lease_fence = item.lease_fence;
 
         // AUTHORITY. The workflow this item runs under, and so the policy and
         // the node definition, come from its EXECUTION record, never from the
@@ -2333,6 +2348,123 @@ mod tests {
         assert_eq!(
             completed_count, 1,
             "expected exactly one NodeCompleted event; got {completed_count}"
+        );
+    }
+
+    // ── Spans stay on the thread that entered them ───────────────────────────
+
+    /// Tells where each span is entered and left, without a registry: a span
+    /// entered on one thread and left on another is the shape that leaves a
+    /// closed span on the first thread's stack.
+    #[derive(Default)]
+    struct SpanThreads(Arc<SpanThreadsLog>);
+
+    #[derive(Default)]
+    struct SpanThreadsLog {
+        next: std::sync::atomic::AtomicU64,
+        /// How many times each span is entered on each thread right now.
+        inside: std::sync::Mutex<HashMap<(u64, std::thread::ThreadId), usize>>,
+        /// Each exit that did not match an enter on the same thread, and each
+        /// enter that was never left.
+        strays: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl tracing::Subscriber for SpanThreads {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let n = self
+                .0
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::span::Id::from_u64(n + 1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, id: &tracing::span::Id) {
+            let at = (id.into_u64(), std::thread::current().id());
+            *self.0.inside.lock().unwrap().entry(at).or_default() += 1;
+        }
+        fn exit(&self, id: &tracing::span::Id) {
+            let at = (id.into_u64(), std::thread::current().id());
+            let mut inside = self.0.inside.lock().unwrap();
+            match inside.get_mut(&at) {
+                Some(n) if *n > 1 => *n -= 1,
+                Some(_) => {
+                    inside.remove(&at);
+                }
+                None => self.0.strays.lock().unwrap().push(format!(
+                    "span {} left on {:?}, which did not enter it",
+                    at.0, at.1
+                )),
+            }
+        }
+    }
+
+    /// Yields many times, so a task that holds a span across the wait is moved
+    /// between threads by the runtime.
+    struct YieldingExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for YieldingExecutor {
+        async fn execute(
+            &self,
+            item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+            NoopExecutor.execute(item).await
+        }
+    }
+
+    /// The node's span is entered by the future at each poll, never by a guard
+    /// that outlives one. A guard held across an `.await` is entered on one
+    /// thread and left on another when the runtime moves the task, which leaves
+    /// a stale span on the first thread: with tracing-subscriber 0.3.21 and
+    /// later, that thread panics when it next asks for the current span, in
+    /// whatever request it is serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_span_is_left_on_the_thread_that_entered_it() {
+        use tracing::instrument::WithSubscriber;
+
+        let subscriber = SpanThreads::default();
+        let log = Arc::clone(&subscriber.0);
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        let mut runs = Vec::new();
+        for _ in 0..32 {
+            let (backend, _) = setup_backend().await;
+            let worker = make_worker(Arc::clone(&backend))
+                .register_executor("tool", Arc::new(YieldingExecutor));
+            let item = backend
+                .claim_work_item("test-worker", &["default"])
+                .await
+                .unwrap()
+                .expect("item must be claimable");
+            runs.push(tokio::spawn(
+                async move { worker.execute_item(item).await }.with_subscriber(dispatch.clone()),
+            ));
+        }
+        for run in runs {
+            run.await.unwrap().unwrap();
+        }
+
+        let mut strays = log.strays.lock().unwrap().clone();
+        strays.extend(
+            log.inside
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|(id, thread)| format!("span {id} still entered on {thread:?}")),
+        );
+        assert!(
+            strays.is_empty(),
+            "{} spans were not left where they were entered, such as: {}",
+            strays.len(),
+            strays.first().unwrap()
         );
     }
 

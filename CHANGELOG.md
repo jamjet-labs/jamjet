@@ -256,6 +256,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python: the workflow compiler holds `cost_budget_usd` to the range registration accepts,
   0 to 10,000. It now compiles 0, which it refused, and refuses a cap above 10,000, NaN or
   infinity, which it compiled for the engine to refuse.
+- **An engine no longer drops a request when a worker task has moved threads.** A worker held
+  a node's tracing span open across its awaits (and the A2A step did the same), so when the
+  runtime moved the task to another thread the first thread kept a span that had closed.
+  With `tracing-subscriber` 0.3.21 and later, that thread then panicked the next time it
+  asked for the current span, in whatever request it was serving, and the caller saw a
+  connection closed with no answer. The span is now attached to the work, not held open, so
+  every thread leaves a span where it entered it. This showed up about once in six runs of
+  the two-engine tests on a busy machine, and the tests now fail if an engine thread panics.
 
 ### Security
 
