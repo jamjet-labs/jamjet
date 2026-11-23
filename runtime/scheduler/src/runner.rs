@@ -1050,10 +1050,16 @@ impl Scheduler {
                             .insert(execution_id.clone(), progress);
                     }
                 }
+                // Its own dispatches are not news: the pass that wrote them
+                // has already acted on them.
+                let besides_dispatches = recorded
+                    .iter()
+                    .filter(|e| !matches!(e, EventKind::NodeScheduled { .. }))
+                    .count();
                 Ok(PassEnd::Done(PassDone {
                     dispatched,
                     terminal,
-                    recorded: recorded.len() as u32,
+                    recorded: besides_dispatches as u32,
                     ..PassDone::default()
                 }))
             }

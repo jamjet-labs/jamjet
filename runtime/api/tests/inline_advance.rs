@@ -1168,6 +1168,34 @@ async fn a_request_that_wrote_nothing_does_not_advance() {
     }
 }
 
+/// A completion whose pass dispatches only a worker's step builds that one
+/// pass. Its own dispatch is not news, so no second pass reads the run and
+/// its log again to find nothing.
+#[tokio::test]
+async fn an_advance_that_dispatches_only_a_worker_step_builds_one_pass() {
+    for kind in kinds() {
+        let Some(env) = Env::new(kind, "an_advance_that_dispatches_only_a_worker_step").await
+        else {
+            continue;
+        };
+        let name = env.name();
+        env.register(&two_steps("wf-one-pass")).await;
+        let run = env.start("wf-one-pass").await;
+        let item = env.claimed("python_tool", "s").await;
+        let before = env.probe.reads_of(&run);
+
+        let reply = env.complete_item(&item).await;
+
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.body);
+        assert_eq!(env.scheduled(&run).await, ["s", "p"], "{name}");
+        assert_eq!(
+            env.probe.reads_of(&run) - before,
+            1,
+            "{name}: one pass for one dispatch"
+        );
+    }
+}
+
 // ── The approvals a run lists ────────────────────────────────────────────────
 
 impl Env {
