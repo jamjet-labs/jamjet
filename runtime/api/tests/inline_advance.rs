@@ -1131,7 +1131,12 @@ impl Env {
     /// and each decided node with its status.
     async fn listed(&self, run: &ExecutionId) -> (Vec<String>, Vec<(String, String)>) {
         let reply = self
-            .call("GET", &format!("/executions/{run}/approvals"), &self.bob, None)
+            .call(
+                "GET",
+                &format!("/executions/{run}/approvals"),
+                &self.bob,
+                None,
+            )
             .await;
         assert_eq!(
             reply.status,
@@ -1151,7 +1156,12 @@ impl Env {
             .as_array()
             .unwrap_or_else(|| panic!("{}: {}", self.name(), reply.body))
             .iter()
-            .map(|row| (node(row), row["status"].as_str().unwrap_or_default().to_string()))
+            .map(|row| {
+                (
+                    node(row),
+                    row["status"].as_str().unwrap_or_default().to_string(),
+                )
+            })
             .collect();
         (pending, decided)
     }
