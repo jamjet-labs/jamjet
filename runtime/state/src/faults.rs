@@ -229,6 +229,10 @@ pub const POINTS: &[(&str, u32)] = &[
     // scheduler/src/runner.rs: a seam, after a pass that dispatched work has
     // committed and before the scheduler updates what it keeps for the run.
     ("dispatch.after_commit", 1),
+    // api/src/driver.rs: seams in a tick, after it has taken its lease and
+    // after each run its walk advanced.
+    ("tick.after_begin", 1),
+    ("tick.mid_walk", 1),
     // audit/src/postgres.rs: the line before every commit of an append to
     // the Postgres audit log, a seal onto the head included.
     ("audit.seal.before_commit", 1),

@@ -430,6 +430,9 @@ impl Scheduler {
                 PassEnd::Done(done) => {
                     report.dispatched = done.dispatched;
                     report.terminal = done.terminal;
+                    report.expired = done.expired;
+                    report.escalated = done.escalated;
+                    report.recorded = done.recorded;
                     return Ok(report);
                 }
                 PassEnd::Stale => {
@@ -567,7 +570,11 @@ impl Scheduler {
                 .await
             {
                 Ok(sweep) if !sweep.expired.is_empty() || !sweep.escalated.is_empty() => {
-                    return Ok(PassEnd::nothing());
+                    return Ok(PassEnd::Done(PassDone {
+                        expired: sweep.expired.len() as u32,
+                        escalated: sweep.escalated.len() as u32,
+                        ..PassDone::default()
+                    }));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -1046,6 +1053,8 @@ impl Scheduler {
                 Ok(PassEnd::Done(PassDone {
                     dispatched,
                     terminal,
+                    recorded: recorded.len() as u32,
+                    ..PassDone::default()
                 }))
             }
             Ok(PassCommit::Stale { .. }) => {
@@ -1061,6 +1070,7 @@ impl Scheduler {
                 Ok(PassEnd::Done(PassDone {
                     dispatched: Vec::new(),
                     terminal: true,
+                    ..PassDone::default()
                 }))
             }
             Err(e) => {
@@ -1101,6 +1111,13 @@ struct PassDone {
     dispatched: Vec<Dispatched>,
     /// It finished the run, or found it already finished.
     terminal: bool,
+    /// Approval requests the pass's deadline sweep expired, and escalated.
+    /// A pass whose sweep recorded either dispatched nothing: the log moved,
+    /// and the next pass folds what the sweep wrote.
+    expired: u32,
+    escalated: u32,
+    /// Events the pass recorded besides its dispatches.
+    recorded: u32,
 }
 
 /// What [`Scheduler::advance_one`] did for one run.
@@ -1113,6 +1130,16 @@ pub struct PassReport {
     /// How many passes the store refused as stale and the scheduler built
     /// again, before the one that was written.
     pub stale: u32,
+    /// Approval requests the pass's deadline sweep expired. Such a pass wrote
+    /// the expiry and nothing else: the next pass folds it (a fallback node
+    /// completes, or the node fails).
+    pub expired: u32,
+    /// Approval requests the pass's deadline sweep escalated.
+    pub escalated: u32,
+    /// Events the written pass recorded besides its dispatches: a fallback
+    /// taken, a node failed or skipped. What they unblock is dispatched by
+    /// the pass that follows.
+    pub recorded: u32,
 }
 
 /// One node a pass dispatched.
@@ -4218,7 +4245,7 @@ mod tests {
             PassReport {
                 dispatched: vec![],
                 terminal: true,
-                stale: 0
+                ..PassReport::default()
             }
         );
         assert_eq!(b.get_events(&e).await.unwrap().len(), before);
@@ -4276,6 +4303,66 @@ mod tests {
             scheduled_nodes(&b.get_events(&e).await.unwrap()),
             vec!["a".to_string(), "b".to_string()],
             "`b` once"
+        );
+    }
+
+    /// A pass whose sweep expired an approval wrote the expiry and nothing
+    /// else, and says so. The pass after it folds the expiry and records what
+    /// follows from it (here a failed node), and says that.
+    #[tokio::test]
+    async fn advance_one_reports_an_expiry_its_sweep_recorded_and_what_the_next_pass_wrote() {
+        let (s, b, e) = setup(linear_ir()).await;
+        append(
+            &b,
+            &e,
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+        )
+        .await;
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        append(
+            &b,
+            &e,
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({ "expires_at": past }),
+            },
+        )
+        .await;
+
+        let first = s.advance_one(&e).await.unwrap();
+        assert_eq!(
+            (first.expired, first.escalated, first.recorded),
+            (1, 0, 0),
+            "{first:?}"
+        );
+        assert!(first.dispatched.is_empty() && !first.terminal, "{first:?}");
+
+        let second = s.advance_one(&e).await.unwrap();
+        assert_eq!(
+            (second.expired, second.escalated, second.recorded),
+            (0, 0, 1),
+            "the node fails for the expiry: {second:?}"
+        );
+        let events = b.get_events(&e).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev.kind, EventKind::ApprovalExpired { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev.kind, EventKind::NodeFailed { .. }))
+                .count(),
+            1
         );
     }
 

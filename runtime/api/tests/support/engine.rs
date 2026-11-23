@@ -53,6 +53,8 @@ pub struct TestStore {
     pub developer: String,
     /// Decides approvals.
     pub reviewer: String,
+    /// Ticks an engine that has its loops off (`POST /ops/tick`).
+    pub operator: String,
 }
 
 impl Drop for TestStore {
@@ -115,6 +117,7 @@ impl TestStore {
         };
         let developer = token("developer").await;
         let reviewer = token("reviewer").await;
+        let operator = token("operator").await;
         TestStore {
             backend,
             dir,
@@ -123,6 +126,7 @@ impl TestStore {
             db,
             developer,
             reviewer,
+            operator,
         }
     }
 

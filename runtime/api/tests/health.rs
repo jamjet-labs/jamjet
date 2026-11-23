@@ -2,11 +2,17 @@
 
 mod support;
 
+use axum::body::Body;
+use axum::http::Request;
+use http_body_util::BodyExt;
+use jamjet_api::driver::{Driver, DriverConfig};
 use jamjet_api::features::FEATURES;
+use jamjet_api::routes::build_router_with_opts;
 use jamjet_state::InMemoryBackend;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use support::{get, make_state, post};
+use tower::ServiceExt;
 
 fn state() -> jamjet_api::state::AppState {
     make_state(Arc::new(InMemoryBackend::new()))
@@ -142,6 +148,24 @@ async fn every_feature_has_a_guard() {
                 )
                 .await;
                 assert_eq!(own["claimed"], true, "{own}");
+            }
+            // A tick answers with what it did. An engine without the route
+            // answers with the app's page or a 404, and none of this.
+            "ops_tick" => {
+                let st = state();
+                let (_trigger, shutdown) = jamjet_worker::shutdown();
+                let models = Arc::new(jamjet_models::ModelRegistry::new());
+                let driver = Driver::new(&st, models, shutdown, DriverConfig::default());
+                let resp = build_router_with_opts(st, true)
+                    .layer(axum::Extension(Arc::new(driver)))
+                    .oneshot(Request::post("/ops/tick").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["ran"], true, "{body}");
+                assert!(body["runs"].is_object(), "{body}");
             }
             other => panic!("feature {other} has no guard arm in tests/health.rs"),
         }

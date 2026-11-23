@@ -327,12 +327,12 @@ fn scheduled(events: &[(String, String)]) -> Vec<&str> {
 }
 
 /// Start a run of [`condition_then_work`] on an engine with `env`; its
-/// events after 3 s, and the engine.
+/// events after 3 s, the engine, and the run.
 async fn run_for_three_seconds(
     store: &TestStore,
     name: &str,
     env: &[(&str, &str)],
-) -> (Vec<(String, String)>, Engine) {
+) -> (Vec<(String, String)>, Engine, String) {
     let engine = Engine::start(store, env).await;
     let http = client();
     register(
@@ -344,7 +344,7 @@ async fn run_for_three_seconds(
     .await;
     let run = start_run(&http, &engine.base(), &store.developer, name).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    (events(&engine, &store.developer, &run).await, engine)
+    (events(&engine, &store.developer, &run).await, engine, run)
 }
 
 async fn loops_off_dispatches_nothing(backend: Backend) {
@@ -356,7 +356,7 @@ async fn loops_off_dispatches_nothing(backend: Backend) {
         ("JAMJET_BACKGROUND", "off"),
         ("JAMJET_TICK_ENGINE_CONCURRENCY", "3"),
     ];
-    let (seen, engine) = run_for_three_seconds(&store, "rd-off", &off).await;
+    let (seen, engine, run) = run_for_three_seconds(&store, "rd-off", &off).await;
     assert_eq!(scheduled(&seen), vec!["route"], "{seen:?}");
     assert!(
         !seen.iter().any(|(kind, _)| kind == "node_completed"),
@@ -369,11 +369,41 @@ async fn loops_off_dispatches_nothing(backend: Backend) {
     for started in STARTED {
         assert!(!log.contains(started), "{started}: {log}");
     }
+
+    // A developer's token cannot make it act. A tick with the operator's does
+    // what the loops would have: the first runs `route`, which sat on the
+    // engine's queue, and the next sees it done and dispatches `work`.
+    let http = client();
+    let tick = |token: String| {
+        let (http, base) = (http.clone(), engine.base());
+        async move { must(&http, &base, "POST", "/ops/tick", &token, Some(json!({}))).await }
+    };
+    let (st, refused) = tick(store.developer.clone()).await;
+    assert_eq!(st, 403, "{refused}");
+    let seen = events(&engine, &store.developer, &run).await;
+    assert_eq!(scheduled(&seen), vec!["route"], "{seen:?}");
+
+    let (st, report) = tick(store.operator.clone()).await;
+    assert_eq!(st, 200, "{report}");
+    assert_eq!(report["ran"], true, "{report}");
+    assert_eq!(report["background"], "off", "{report}");
+    assert_eq!(report["engine_steps"]["slow"], 1, "{report}");
+    let seen = events(&engine, &store.developer, &run).await;
+    assert!(
+        seen.contains(&("node_completed".to_string(), "route".to_string())),
+        "{seen:?}"
+    );
+
+    let (st, report) = tick(store.operator.clone()).await;
+    assert_eq!(st, 200, "{report}");
+    assert_eq!(report["runs"]["advanced"], 1, "{report}");
+    let seen = events(&engine, &store.developer, &run).await;
+    assert_eq!(scheduled(&seen), vec!["route", "work"], "{seen:?}");
     drop(engine);
 
     // The same workflow with the loops on runs `route` and dispatches
     // `work` in that time, so the case above can fail.
-    let (seen, _engine) = run_for_three_seconds(&store, "rd-on", &[]).await;
+    let (seen, _engine, _run) = run_for_three_seconds(&store, "rd-on", &[]).await;
     assert_eq!(scheduled(&seen), vec!["route", "work"], "{seen:?}");
 }
 

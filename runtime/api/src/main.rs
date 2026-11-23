@@ -343,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
 
     // On Postgres, the outbox drain seals the sealed events whose inline
     // seal was lost: now, and every 2 s.
-    if let Some(pg) = postgres.filter(|_| background == Background::On) {
+    if let Some(pg) = postgres.clone().filter(|_| background == Background::On) {
         jamjet_api::store::spawn_outbox_drain(pg, state.enricher.clone());
         info!("Audit outbox drain started");
     }
@@ -368,6 +368,23 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // The driver answers `POST /ops/tick`: it runs the engine's own steps, so
+    // it exists wherever this process can (the loops off, dev mode or the
+    // embedded workers). An engine with the loops on and no workers of its
+    // own leaves those steps to whoever runs them, and has no tick to offer.
+    let driver = model_registry.clone().map(|models| {
+        let driver = jamjet_api::driver::Driver::new(
+            &state,
+            models,
+            shutdown.clone(),
+            background_plan.driver,
+        )
+        .with_background(background);
+        Arc::new(match postgres {
+            Some(pg) => driver.with_outbox(pg),
+            None => driver,
+        })
+    });
     if let Some(model_registry) = model_registry.filter(|_| background == Background::On) {
         // Exactly the kinds `POST /workflows` accepts as in-process
         // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
@@ -412,6 +429,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router = build_router_with_opts(state, config.dev_mode);
+    let router = match driver {
+        Some(driver) => router.layer(axum::Extension(driver)),
+        None => router,
+    };
     // Dev mode answers only requests addressed to this machine (or a name in
     // JAMJET_DEV_ALLOWED_HOSTS), not relayed and not cross-site, on any bind:
     // see `startup::dev_refusal`.

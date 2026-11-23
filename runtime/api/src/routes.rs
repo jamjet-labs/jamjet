@@ -105,6 +105,9 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             "/tenants/:id",
             operator_only(get(get_tenant).put(update_tenant), dev_mode),
         )
+        // The tick: what the engine's loops would do, once, on request. Operator
+        // only outside dev mode, and POST only: it makes the engine act.
+        .route("/ops/tick", operator_only(post(ops_tick), dev_mode))
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         // Coordinator decisions and agent search
@@ -5345,6 +5348,79 @@ async fn search_agents(
         .collect();
 
     Ok(Json(json!({ "agents": agents })))
+}
+
+// ── Request-driven mode ──────────────────────────────────────────────────────
+
+/// The body of `POST /ops/tick`: empty, `{}`, or a budget that can only be
+/// lowered. Nothing in it names a run, a tenant or a node.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TickRequest {
+    budget_ms: Option<u64>,
+}
+
+/// `POST /ops/tick` — one sweep of what the engine's loops do: reclaim lapsed
+/// leases, seal the audit outbox, advance each running run from where the
+/// last tick stopped, run the engine steps left on the queues, project.
+///
+/// Who may call it is decided by the layers in front (a token `require_auth`
+/// admits, with the operator role; no token in dev mode), never by anything
+/// in the request. `200` with the report, or `200` with `ran: false` when
+/// another tick holds the lease; `503` while the server stops; `400` for a
+/// body that is not empty, `{}` or a `budget_ms` of at least 100.
+async fn ops_tick(
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    use crate::driver::{TickResult, MIN_TICK_BUDGET};
+    // A server that is stopping starts no tick: it would have the drain wait
+    // for work the stop is trying to end.
+    let stopping = draining
+        .as_ref()
+        .is_some_and(|Extension(d)| d.0.load(std::sync::atomic::Ordering::SeqCst));
+    if stopping {
+        return Err(ApiError::Unavailable("shutting down".into()));
+    }
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        TickRequest { budget_ms: None }
+    } else {
+        serde_json::from_slice::<TickRequest>(&body)
+            .map_err(|e| ApiError::BadRequest(format!("invalid tick request: {e}")))?
+    };
+    let Some(Extension(driver)) = driver else {
+        return Err(ApiError::Conflict(
+            "this engine cannot tick: it has no driver. Start it with JAMJET_BACKGROUND=off, \
+             or with its embedded workers on, to give it one"
+                .into(),
+        ));
+    };
+    let budget = match request.budget_ms {
+        None => driver.config().tick_budget,
+        Some(ms) if ms < MIN_TICK_BUDGET.as_millis() as u64 => {
+            return Err(ApiError::BadRequest(format!(
+                "budget_ms must be at least {}",
+                MIN_TICK_BUDGET.as_millis()
+            )));
+        }
+        // A larger budget is held to the configured one.
+        Some(ms) => std::time::Duration::from_millis(ms).min(driver.config().tick_budget),
+    };
+    match driver.tick(budget).await? {
+        TickResult::Ran(report) => Ok(Json(json!(*report)).into_response()),
+        TickResult::Busy {
+            held_by,
+            lease_until,
+        } => Ok(Json(json!({
+            "ran": false,
+            "reason": "busy",
+            "held_by": held_by,
+            "lease_until": lease_until.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        }))
+        .into_response()),
+        TickResult::Stopping => Err(ApiError::Unavailable("shutting down".into())),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -4,4 +4,9 @@
 
 /// Sorted, unique, `[a-z0-9_]+`. A name is added only with a guard arm in
 /// `tests/health.rs` that exercises it.
-pub const FEATURES: &[&str] = &["claim_by_execution", "python_fn_by_execution", "run_key"];
+pub const FEATURES: &[&str] = &[
+    "claim_by_execution",
+    "ops_tick",
+    "python_fn_by_execution",
+    "run_key",
+];
