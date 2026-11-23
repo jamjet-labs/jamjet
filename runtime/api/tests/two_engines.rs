@@ -266,6 +266,8 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
             stale >= 1,
             "neither scheduler logged a stale pass, so their race never opened"
         );
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }
@@ -418,6 +420,8 @@ async fn two_engines_cancel_and_finish_race_once() {
                 "no staggered cancel landed while its finish was due, so the race \
                  opened only at one phase of the tick"
             );
+            a.assert_no_panics();
+            b.assert_no_panics();
         })
         .await;
     }
@@ -468,6 +472,8 @@ async fn skewed_engine_does_not_reclaim_a_live_lease() {
             .await
             .unwrap();
         assert_eq!(st, 200, "the lease still holds: {body}");
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }
@@ -531,6 +537,8 @@ async fn skewed_engine_does_not_expire_an_approval_early() {
             "the request is no longer pending: {still:?}"
         );
         pool.close().await;
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }
