@@ -36,6 +36,10 @@ def _base_kwargs(request: ModelRequest) -> dict[str, Any]:
     return kwargs
 
 
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 class LiteLLMBackend:
     async def complete(self, request: ModelRequest) -> ModelResponse:
         litellm = _import_litellm()
@@ -51,12 +55,21 @@ class LiteLLMBackend:
             cost = float(litellm.completion_cost(completion_response=resp))
         except Exception:
             cost = None
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
         return ModelResponse(
             message=resp.choices[0].message,
-            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             cost_usd=cost,
             raw=resp,
+            # Reported only when the answer carried both counts: an answer
+            # with no usage is not a call that used nothing.
+            usage_reported=usage is not None and _is_count(input_tokens) and _is_count(output_tokens),
+            # LiteLLM calls exactly the model it is given. The provider's own
+            # name for it (`resp.model`, often a dated snapshot) is not the
+            # name an allow list holds.
+            model=request.ref.litellm_model,
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:

@@ -8,15 +8,21 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
-from jamjet.transport import EngineAuth, EngineFeatureMissing, RetryPolicy
+from jamjet.transport import EngineAuth, EngineFeatureMissing, RetryPolicy, RunKeyConflict
 from jamjet.transport import JamjetAPIError as JamjetAPIError
 from jamjet.transport import body_is_replayable as _body_is_replayable
 from jamjet.transport import raise_for_status as _raise_for_status
 from jamjet.transport import send_with_retries as _send_with_retries
+
+# The engine's rule for a run_key: 1 to 200 bytes of these characters, taken
+# as sent (never trimmed or normalised).
+_MAX_RUN_KEY = 200
+_RUN_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@+=-")
+_REUSE = ("never", "failed_only")
 
 
 @dataclass(frozen=True)
@@ -53,11 +59,12 @@ class JamjetClient:
     sends a call again when that cannot do it twice. A request that never left
     and a 429 are sent again for every call. A call that is safe to repeat
     (every GET, a heartbeat, a complete or fail with a lease fence, registering
-    a workflow, storing an artifact) is also sent again after a lost answer or
-    a 5xx. Any other call whose answer was lost raises ``OutcomeUnknown`` and
-    is not sent again: check whether it took effect before you repeat it. A
-    call whose body can be read only once (an iterator, or a file that cannot
-    seek) is sent once.
+    a workflow, storing an artifact, a start with a ``run_key``, a claim for
+    one run) is also sent
+    again after a lost answer or a 5xx. Any other call whose answer was lost
+    raises ``OutcomeUnknown`` and is not sent again: check whether it took
+    effect before you repeat it. A call whose body can be read only once (an
+    iterator, or a file that cannot seek) is sent once.
     """
 
     def __init__(
@@ -85,13 +92,16 @@ class JamjetClient:
             follow_redirects=False,
         )
 
-    async def _request(self, method: str, url: str, *, safe: bool, operation: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self, method: str, url: str, *, safe: bool, operation: str, advice: str | None = None, **kwargs: Any
+    ) -> httpx.Response:
         """Send one call and raise ``JamjetAPIError`` for a non-2xx answer.
 
         Every call goes through here. Credentials come from the client's own
         auth flow, so a call cannot bring its own ``auth`` or follow a redirect.
         ``safe`` says whether the call may be sent again after it may have
-        taken effect; ``operation`` names it in ``OutcomeUnknown``.
+        taken effect; ``operation`` names it in ``OutcomeUnknown`` and
+        ``advice`` ends that message.
         """
         refused = [name for name in ("auth", "follow_redirects") if name in kwargs]
         if refused:
@@ -109,6 +119,7 @@ class JamjetClient:
             operation=operation,
             policy=self._retry,
             credential_headers=self._credential_headers,
+            advice=advice,
         )
 
     def _credential_headers(self) -> frozenset[str]:
@@ -135,6 +146,18 @@ class JamjetClient:
             return frozenset()
         return frozenset(f for f in listed if isinstance(f, str))
 
+    async def require_features(self, *features: str) -> None:
+        """Raise ``EngineFeatureMissing`` for the first of ``features`` the
+        engine does not list in ``/health``. Sends nothing but that read."""
+        listed = await self.engine_features()
+        for feature in features:
+            if feature not in listed:
+                raise EngineFeatureMissing(feature, engine_commit=self._engine_commit())
+
+    def _engine_commit(self) -> str | None:
+        commit = (self._health or {}).get("commit") if isinstance(self._health, dict) else None
+        return commit if isinstance(commit, str) else None
+
     # ── Request-driven mode ───────────────────────────────────────────────
 
     async def tick(self, *, budget_ms: int | None = None) -> dict[str, Any]:
@@ -150,9 +173,7 @@ class JamjetClient:
             r = await self._request("POST", "/ops/tick", json=body, safe=True, operation="tick")
         except JamjetAPIError as exc:
             if exc.response.status_code == 404:
-                commit = (self._health or {}).get("commit")
-                engine_commit = commit if isinstance(commit, str) else None
-                raise EngineFeatureMissing("ops_tick", engine_commit=engine_commit) from exc
+                raise EngineFeatureMissing("ops_tick", engine_commit=self._engine_commit()) from exc
             raise
         return r.json()
 
@@ -201,17 +222,38 @@ class JamjetClient:
         workflow_id: str,
         input: dict[str, Any],
         workflow_version: str | None = None,
+        *,
         run_key: str | None = None,
-        reuse: str | None = None,
+        reuse: Literal["never", "failed_only"] | None = None,
     ) -> dict[str, Any]:
         """Start a run.
 
-        With ``run_key``, a retried start returns the same run instead of a
-        second one (201 for the first start, 200 after). ``reuse`` is
-        ``"never"`` (the default) or ``"failed_only"``. An engine that does
-        not know ``run_key`` drops it and starts a second run, so an answer
-        that does not echo the key raises ``JamjetAPIError``.
+        With ``run_key``, a start sent again returns the run the first one
+        started instead of a second run: 201 for the first start, 200 with the
+        same ``execution_id`` after. So a start with a key is sent again after
+        a lost answer. The key is 1 to 200 bytes of ``A-Z a-z 0-9 . _ : / @ + = -``
+        and is checked here, before anything is sent. ``reuse`` is
+        ``"never"`` (the default) or ``"failed_only"``: a new run starts under
+        the key once the run it names ended without success. A start with
+        ``"failed_only"`` is not sent again after a lost answer, since the
+        second send could start a new run.
+
+        An engine that does not know ``run_key`` drops it and starts a new run
+        on every retry. So before the first start with a key the client reads
+        ``/health`` and raises ``EngineFeatureMissing("run_key")`` when the
+        engine does not list it; nothing is written. An answer that does not
+        echo the key raises ``JamjetAPIError`` naming the run that started. The
+        same key with another workflow, version or input raises
+        ``RunKeyConflict``.
         """
+        if run_key is None:
+            if reuse is not None:
+                raise ValueError("reuse applies to a start with a run_key only")
+        else:
+            _check_run_key(run_key)
+            if reuse is not None and reuse not in _REUSE:
+                raise ValueError(f"reuse must be 'never' or 'failed_only', not {reuse!r}")
+            await self.require_features("run_key")
         body: dict[str, Any] = {"workflow_id": workflow_id, "input": input}
         if workflow_version:
             body["workflow_version"] = workflow_version
@@ -219,17 +261,70 @@ class JamjetClient:
             body["run_key"] = run_key
         if reuse is not None:
             body["reuse"] = reuse
-        # Sent again, it could start a second run.
-        r = await self._request("POST", "/executions", json=body, safe=False, operation="start_execution")
+        # Without a key, a second send could start a second run. With one, the
+        # engine answers it with the first run, unless failed_only lets the
+        # key move to a new run in between.
+        safe = run_key is not None and reuse != "failed_only"
+        if run_key is None:
+            advice = "Start it with a run_key to make a start safe to send again."
+        else:
+            advice = f"Look the run up with find_execution({run_key!r}) before you start it again."
+        try:
+            r = await self._request(
+                "POST", "/executions", json=body, safe=safe, operation="start_execution", advice=advice
+            )
+        except JamjetAPIError as exc:
+            if run_key is None or exc.response.status_code != 409:
+                raise
+            raise await self._run_key_conflict(exc, run_key) from exc
         answer = r.json()
         if run_key is not None and not (isinstance(answer, dict) and answer.get("run_key") == run_key):
-            raise JamjetAPIError(
-                "this engine does not support run_key; upgrade it before relying on it",
-                request=r.request,
-                response=r,
-                detail="this engine does not support run_key; upgrade it before relying on it",
+            started = answer.get("execution_id") if isinstance(answer, dict) else None
+            message = (
+                "this engine does not support run_key; upgrade it before relying on it. "
+                f"It did not echo run_key {run_key!r}, and it started run {started!r}"
             )
+            raise JamjetAPIError(message, request=r.request, response=r, detail=message)
         return answer
+
+    async def _run_key_conflict(self, exc: JamjetAPIError, run_key: str) -> JamjetAPIError:
+        """The error for a 409 on a keyed start. It is ``RunKeyConflict`` when
+        the key holds a run; any other 409 (a version that cannot be started)
+        is returned as it is, and so is one whose lookup fails."""
+        try:
+            held = await self.find_execution(run_key)
+        except Exception:  # noqa: BLE001 - the 409 is the error to raise; the lookup only names the run
+            return exc
+        if held is None:
+            return exc
+        existing = held.get("execution_id")
+        return RunKeyConflict(
+            str(exc),
+            request=exc.request,
+            response=exc.response,
+            detail=exc.detail,
+            existing_execution_id=existing if isinstance(existing, str) else None,
+        )
+
+    async def find_execution(self, run_key: str) -> dict[str, Any] | None:
+        """The run ``run_key`` names, as ``GET /executions?run_key=`` lists it,
+        or None when the key names no run.
+
+        An engine that does not know the lookup ignores the query and lists
+        every run, so an answer that does not echo the key raises
+        ``EngineFeatureMissing("run_key")``.
+        """
+        _check_run_key(run_key)
+        r = await self._request(
+            "GET", "/executions", params={"run_key": run_key}, safe=True, operation="find_execution"
+        )
+        answer = r.json()
+        rows = answer.get("executions") if isinstance(answer, dict) else None
+        if not (isinstance(answer, dict) and answer.get("run_key") == run_key):
+            raise EngineFeatureMissing("run_key", engine_commit=self._engine_commit())
+        if not isinstance(rows, list) or len(rows) > 1 or not all(isinstance(row, dict) for row in rows):
+            raise ValueError(f"the answer to GET /executions?run_key= is not one run or none: {answer!r}")
+        return rows[0] if rows else None
 
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
         r = await self._request("GET", f"/executions/{execution_id}", safe=True, operation="get_execution")
@@ -496,6 +591,37 @@ class JamjetClient:
             return None
         return data["work_item"]
 
+    async def claim_for_execution(
+        self,
+        worker_id: str,
+        queue_types: list[str],
+        execution_id: str,
+        *,
+        node_id: str | None = None,
+        lease_secs: int | None = None,
+        wait_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Claim the next item of one run on ``queue_types``.
+
+        Only the token that started the run may make this claim. ``wait_ms``
+        waits up to that long (the engine allows 10000) for an item to be
+        queued. Returns the whole answer: ``{"claimed": true, "work_item": ...}``,
+        or ``{"claimed": false, "reason": ...}`` saying why nothing came back.
+
+        The same ``worker_id`` claiming again gets the item it already holds,
+        under the same lease, so a claim whose answer was lost is sent again.
+        """
+        body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types, "execution_id": execution_id}
+        if node_id is not None:
+            body["node_id"] = node_id
+        if lease_secs is not None:
+            body["lease_secs"] = int(lease_secs)
+        if wait_ms is not None:
+            body["wait_ms"] = int(wait_ms)
+        r = await self._request("POST", "/work-items/claim", json=body, safe=True, operation="claim_for_execution")
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+
     async def complete_work_item(
         self,
         item_id: str,
@@ -566,6 +692,35 @@ class JamjetClient:
             json=body,
             safe=bool(lease_fence),
             operation="complete_work_item",
+        )
+
+    async def complete_model_step(
+        self,
+        item_id: str,
+        model_result: dict[str, Any],
+        *,
+        lease_fence: int,
+        idempotency_key: str | None = None,
+        duration_ms: int = 0,
+    ) -> None:
+        """Complete a worker model step with the model's answer.
+
+        A ``model`` node marked ``executor: worker`` takes ``model_result``
+        (the content, the finish reason, the model that answered, the tool
+        calls and the usage), never an output or a state patch: the engine
+        builds those from the answer. The engine requires the fence. A late
+        or repeated answer is a 409 and records nothing.
+        """
+        body: dict[str, Any] = {"lease_fence": lease_fence, "duration_ms": duration_ms, "model_result": model_result}
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        # Fenced, a second send is refused with 409 once the first lands.
+        await self._request(
+            "POST",
+            f"/work-items/{item_id}/complete",
+            json=body,
+            safe=bool(lease_fence),
+            operation="complete_model_step",
         )
 
     async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
@@ -640,3 +795,14 @@ class JamjetClient:
 def _operation(method: str, path: str) -> str:
     """How ``OutcomeUnknown`` names a generic call: the method and the path, without host or query."""
     return f"{method} {httpx.URL(path).path}"
+
+
+def _check_run_key(run_key: str) -> None:
+    """Refuse a key the engine would refuse, before anything is sent."""
+    if not (
+        isinstance(run_key, str) and 1 <= len(run_key) <= _MAX_RUN_KEY and all(ch in _RUN_KEY_CHARS for ch in run_key)
+    ):
+        raise ValueError(
+            f"run_key must be 1 to {_MAX_RUN_KEY} characters of A-Z, a-z, 0-9 and . _ : / @ + = - "
+            "(no space, control or format character)"
+        )

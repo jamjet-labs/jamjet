@@ -31,8 +31,9 @@ from tests.test_client_auth import BASE, CALLS, TOKEN, Call, _answer
 NOW = 1795168800.0
 
 # Whether each client call may be sent again after it may have taken effect.
-# complete_work_item and fail_work_item are safe here because the table's
-# calls carry a lease fence; without one they are unsafe (see UNFENCED).
+# complete_work_item, complete_model_step and fail_work_item are safe here
+# because the table's calls carry a lease fence; without one they are unsafe
+# (see UNFENCED).
 SAFE = {
     "health": True,
     "create_workflow": True,
@@ -56,11 +57,16 @@ SAFE = {
     "deactivate_agent": False,
     "discover_agent": False,
     "claim_work_item": False,
+    # The same worker id claiming one run again gets the lease it holds.
+    "claim_for_execution": True,
     "complete_work_item": True,
+    "complete_model_step": True,
     "fail_work_item": True,
     "heartbeat_work_item": True,
     "tick": True,
     "engine_features": True,
+    "require_features": True,
+    "find_execution": True,
     "post": False,
     "get": True,
 }
@@ -72,6 +78,12 @@ UNFENCED = [
     Call(
         "complete_work_item",
         lambda c: c.complete_work_item("wi-1", "exec_1", "n1", {"r": 1}, {}),
+        "POST",
+        "/work-items/wi-1/complete",
+    ),
+    Call(
+        "complete_model_step",
+        lambda c: c.complete_model_step("wi-1", {"content": "", "finish_reason": "stop", "model": "m"}, lease_fence=0),
         "POST",
         "/work-items/wi-1/complete",
     ),
@@ -150,10 +162,11 @@ async def test_a_read_timeout_on_a_plain_start_is_outcome_unknown() -> None:
     assert isinstance(error.__cause__, httpx.ReadTimeout)
     # A caller's `except httpx.RequestError: retry` must not catch it and send it again.
     assert not isinstance(error, httpx.HTTPError)
-    # start_execution takes no run_key yet, so the message must not point at one.
+    # A start without a key is the one start that is unsafe, so the message points at the key.
     assert str(error) == (
         "start_execution may have taken effect, but its answer was lost (ReadTimeout). It was not sent again, "
-        "because a second send could do it twice. Check whether it took effect before you repeat it."
+        "because a second send could do it twice. Check whether it took effect before you repeat it. "
+        "Start it with a run_key to make a start safe to send again."
     )
 
 

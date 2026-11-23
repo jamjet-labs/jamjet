@@ -9,4 +9,5 @@ pub const FEATURES: &[&str] = &[
     "ops_tick",
     "python_fn_by_execution",
     "run_key",
+    "worker_model_steps",
 ];

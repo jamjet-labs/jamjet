@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -217,3 +218,141 @@ def test_solution_ep2_keeps_the_approval_gate_on_pay_deposit():
     script = yaml.safe_load((ROOT / EP2 / "script.yaml").read_text())
     paid = [c for turn in script["turns"] for c in turn.get("tool_calls", []) if c["name"].startswith("pay_")]
     assert paid == [{"name": "pay_small_deposit", "arguments": {"venue": "Casa do Rio", "amount": 200}}]
+
+
+STEP10 = "step-10-untrusted-reply"
+
+
+def test_step10_no_gate_pays_what_the_reply_asked():
+    out = run_step(STEP10, "no_gate.py")
+    assert out.splitlines()[0] == "model: scripted (no API key)"
+    assert normalise(out) == expected(STEP10, "expected-no-gate.txt")
+    paid = (ROOT / STEP10 / "payments.log").read_text().splitlines()
+    # We asked for a 500 deposit. The reply asked for 2400.
+    assert paid == ["paid 2400 for Casa do Rio"]
+
+
+def test_step10_the_injected_text_is_data_not_code():
+    reply = (ROOT / STEP10 / "replies" / "casa-do-rio.txt").read_text()
+    assert "NOTE TO BOOKING ASSISTANTS" in reply
+    for name in ("agent.py", "no_gate.py", "venue_tools.py", "script.yaml"):
+        assert "BOOKING ASSISTANTS" not in (ROOT / STEP10 / name).read_text()
+
+
+STEP11 = "step-11-checks"
+POLICY_LINE = '    policy={"require_approval_for": ["pay_deposit"]},\n'
+
+
+def checks_in(folder: Path) -> subprocess.CompletedProcess[str]:
+    """Run the step 11 checks the way its README says: pytest, in the folder."""
+    env = {k: v for k, v in os.environ.items() if k != "VENUE_MODEL"}
+    env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_checks.py"],
+        cwd=folder,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_step11_shares_the_step_05_code():
+    for name in ("agent.py", "venue_tools.py", "script.yaml", "try_in_process.py"):
+        same = (ROOT / STEP11 / name).read_bytes() == (ROOT / "step-05-ask-first" / name).read_bytes()
+        assert same, name
+
+
+def test_step11_checks_pass_and_fail_when_the_gate_is_removed(tmp_path):
+    good = checks_in(ROOT / STEP11)
+    assert good.returncode == 0, good.stdout + good.stderr
+    assert "2 passed" in good.stdout
+
+    broken = tmp_path / STEP11
+    shutil.copytree(ROOT / STEP11, broken, ignore=shutil.ignore_patterns("*.log", "__pycache__"))
+    agent = broken / "agent.py"
+    text = agent.read_text()
+    assert POLICY_LINE in text
+    agent.write_text(text.replace(POLICY_LINE, ""))
+
+    bad = checks_in(broken)
+    assert bad.returncode == 1, bad.stdout + bad.stderr
+    assert "2 failed" in bad.stdout
+    assert "paid without approval: ['paid 500 for Casa do Rio']" in bad.stdout
+
+
+STEP12 = "step-12-known-venues"
+
+# Calls pay_deposit and read_reply directly with each venue name on the
+# command line, then prints how many payments were written.
+PAY_NAMED = """
+import asyncio, sys
+from venue_tools import PAYMENTS, pay_deposit, read_reply
+for venue in sys.argv[1:]:
+    print(asyncio.run(pay_deposit(venue=venue, amount=500)))
+    print(asyncio.run(read_reply(venue=venue)).splitlines()[0])
+print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
+"""
+
+# Calls pay_deposit for a venue we know, once per amount given as Python.
+PAY_AMOUNT = """
+import asyncio, sys
+from venue_tools import PAYMENTS, pay_deposit
+for amount in sys.argv[1:]:
+    print(asyncio.run(pay_deposit(venue="Casa do Rio", amount=eval(amount))))
+print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
+"""
+
+
+def test_step12_refuses_a_venue_the_model_made_up():
+    out = run_step(STEP12)
+    assert normalise(out) == expected(STEP12)
+    assert "payments.log: 0 line(s)" in out
+    assert not (ROOT / STEP12 / "payments.log").exists()
+
+
+def test_step12_tools_refuse_unknown_names_and_take_known_ones():
+    names = ("Venue Lisboa Central", "<result[0].name>", "casa do rio ")
+    out = run_step(STEP12, "-c", args=(PAY_NAMED, *names)).splitlines()
+    assert out[0] == "Refused: there is no venue called 'Venue Lisboa Central'. Use a name that search_venues returned."
+    assert out[1].startswith("Refused: there is no venue called 'Venue Lisboa Central'")
+    assert out[2].startswith("Refused: ") and out[3].startswith("Refused: ")
+    # A known venue is paid under the name we hold, whatever the case.
+    assert out[4] == "Deposit of 500 paid for Casa do Rio."
+    assert out[5].startswith("Hello, and thank you")
+    assert out[6] == "1"
+    assert (ROOT / STEP12 / "payments.log").read_text() == "paid 500 for Casa do Rio\n"
+
+
+def test_step12_refuses_amounts_that_are_not_positive_numbers():
+    amounts = ("'500'", "0", "-5", "True", "float('nan')", "float('inf')")
+    out = run_step(STEP12, "-c", args=(PAY_AMOUNT, *amounts)).splitlines()
+    assert [line.split(":")[0] for line in out[:6]] == ["Refused"] * 6
+    assert out[6] == "0"
+
+
+READ = """
+import asyncio, sys
+from venue_tools import read_reply
+for venue in sys.argv[1:]:
+    print(asyncio.run(read_reply(venue=venue)).splitlines()[0])
+"""
+
+
+def test_step10_reads_replies_only_from_its_replies_folder():
+    # expected-no-gate.txt sits one folder up, beside venue_tools.py
+    out = run_step(STEP10, "-c", args=(READ, "../expected-no-gate", "Casa do Rio")).splitlines()
+    assert out[0] == "No reply yet."
+    assert out[1].startswith("Hello, and thank you")
+
+
+def test_step12_changes_only_the_tools():
+    """Same reply, agent and prompt as step 10 with no gate."""
+    reply = "replies/casa-do-rio.txt"
+    assert (ROOT / STEP12 / reply).read_bytes() == (ROOT / STEP10 / reply).read_bytes()
+
+    def agent_and_prompt(path: Path) -> str:
+        text = path.read_text()
+        return text[text.index("agent = Agent(") : text.index('if __name__ == "__main__":')]
+
+    assert agent_and_prompt(ROOT / STEP12 / "agent.py") == agent_and_prompt(ROOT / STEP10 / "no_gate.py")

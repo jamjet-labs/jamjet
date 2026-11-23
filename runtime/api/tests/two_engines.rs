@@ -8,7 +8,8 @@
 //! engine they did not claim from. At the end the invariants hold
 //! ([`jamjet_testkit::invariants`]), and the two schedulers' logs show at
 //! least one pass the store refused as stale, so the race between them was
-//! run.
+//! run. Whether a round of runs opens that race is down to timing, so the
+//! cases add rounds until it has (see `RACE_WINDOW`).
 //!
 //! The Postgres cases skip without `JAMJET_TEST_POSTGRES_URL`.
 #![cfg(unix)]
@@ -24,7 +25,7 @@ use jamjet_testkit::invariants::{Snapshot, Violation};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// What the scheduler logs at debug level for each pass the store refused.
@@ -87,15 +88,54 @@ fn no_violations(violations: &[Violation]) {
     );
 }
 
-/// `runs` runs on two engines, as the module docs say. Each engine also
-/// answers the other's approvals and completions.
+/// How long the two schedulers get to race. A pass is refused as stale when
+/// the run's log moved between the scheduler's read of it and its commit,
+/// under another scheduler's pass or a worker's or the approver's call. The
+/// two schedulers tick every 500 ms, a few tens of milliseconds apart, so on
+/// a quick machine the second can find each run already done, and a round
+/// logs none, or three or four. A round with none is followed by another of
+/// `runs` more runs, until one logs a stale pass or this has passed since
+/// the engines were up.
+const RACE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Every run of `ids` completed, with its approval decided once and each of
+/// its nodes completed once.
+fn each_run_once(snapshot: &Snapshot, ids: &[String]) {
+    for id in ids {
+        assert_eq!(snapshot.status_of(id), Some("completed"), "run {id}");
+        let approvals = snapshot
+            .events_of(id)
+            .filter(|e| e.kind_type() == "approval_received")
+            .count();
+        assert_eq!(approvals, 1, "run {id} was approved {approvals} times");
+        for node in ["approve", "work"] {
+            let done = snapshot
+                .events_of(id)
+                .filter(|e| e.kind_type() == "node_completed" && e.node() == Some(node))
+                .count();
+            assert_eq!(done, 1, "run {id} completed {node} {done} times");
+        }
+    }
+}
+
+/// `runs` runs on two engines, as the module docs say, and more in further
+/// rounds of `runs` while no scheduler has logged a stale pass (see
+/// [`RACE_WINDOW`]). Each engine also answers the other's approvals and
+/// completions.
 async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Duration) {
     let Some(store) = TestStore::on(backend, case).await else {
         return;
     };
     within(case, budget, async {
-        let a = Engine::start(&store, &[]).await;
-        let b = Engine::start(&store, &[]).await;
+        // Two hundred runs at once keep every connection of a pool of the
+        // harness's usual 5 busy, and a call that waits more than the acquire
+        // timeout for one is answered 503. The server's own default is 10.
+        let env: &[(&str, &str)] = match backend {
+            Backend::Postgres => &[("JAMJET_PG_POOL_SIZE", "10")],
+            Backend::Sqlite => &[],
+        };
+        let a = Engine::start(&store, env).await;
+        let b = Engine::start(&store, env).await;
         let engines = [a.base(), b.base()];
         let http = client();
         let workflow = format!("two-engines-{}", uuid::Uuid::new_v4().simple());
@@ -129,21 +169,8 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
             ),
         ];
 
-        // Start the runs on A and B in turn, twenty at a time.
-        let mut started: Vec<(String, usize)> = Vec::new();
-        for chunk in (0..runs).collect::<Vec<_>>().chunks(20) {
-            let starts = chunk.iter().map(|i| {
-                let http = http.clone();
-                let base = engines[i % 2].clone();
-                let token = store.developer.clone();
-                let workflow = workflow.clone();
-                let on = i % 2;
-                async move { (start_run(&http, &base, &token, &workflow).await, on) }
-            });
-            started.extend(futures_join(starts).await);
-        }
-        let starter: BTreeMap<String, usize> = started.iter().cloned().collect();
-        let ids: Vec<String> = started.iter().map(|(id, _)| db_id(id)).collect();
+        // The engine each run started on, by the run's API id.
+        let starter: Arc<Mutex<BTreeMap<String, usize>>> = Arc::default();
 
         // Approve each run through the engine that did not start it.
         let approver = {
@@ -151,74 +178,103 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
             let engines = engines.clone();
             let token = store.reviewer.clone();
             let stop = stop.clone();
+            let starter = starter.clone();
             tokio::spawn(async move {
                 let mut decided: BTreeSet<String> = BTreeSet::new();
-                while !stop.load(Ordering::SeqCst) && decided.len() < starter.len() {
+                while !stop.load(Ordering::SeqCst) {
                     for base in &engines {
                         for row in engine::pending(&http, base, &token).await {
                             let run = row["execution_id"].as_str().unwrap().to_string();
+                            let started_on = starter.lock().unwrap().get(&run).copied();
+                            let Some(started_on) = started_on else {
+                                // Its start has not come back yet.
+                                continue;
+                            };
                             if decided.contains(&run) {
                                 continue;
                             }
-                            let other = &engines[1 - starter[&run]];
+                            let other = &engines[1 - started_on];
                             match approve(&http, other, &token, &row).await {
                                 Ok((200, _)) => {
                                     decided.insert(run);
                                 }
                                 Ok((st, body)) => panic!("approval of {run} refused: {st} {body}"),
-                                Err(e) => panic!("approval of {run}: {e}"),
+                                Err(e) => panic!("approval of {run}: {e:?}"),
                             }
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                decided.len()
             })
         };
 
-        let snapshot = finished(&store, &ids, budget).await;
+        // Round after round, start the runs on A and B in turn, twenty at a
+        // time, and wait for them to finish, until a scheduler has logged a
+        // stale pass or the window is over.
+        let race_over = Instant::now() + RACE_WINDOW;
+        let mut ids: Vec<String> = Vec::new();
+        let mut rounds = 0;
+        let snapshot = loop {
+            rounds += 1;
+            for chunk in (0..runs).collect::<Vec<_>>().chunks(20) {
+                let starts = chunk.iter().map(|i| {
+                    let http = http.clone();
+                    let base = engines[i % 2].clone();
+                    let token = store.developer.clone();
+                    let workflow = workflow.clone();
+                    let on = i % 2;
+                    async move { (start_run(&http, &base, &token, &workflow).await, on) }
+                });
+                for (id, on) in futures_join(starts).await {
+                    ids.push(db_id(&id));
+                    starter.lock().unwrap().insert(id, on);
+                }
+            }
+            let snapshot = finished(&store, &ids, budget).await;
+            each_run_once(&snapshot, &ids);
+            if a.count(STALE) + b.count(STALE) >= 1 || Instant::now() >= race_over {
+                break snapshot;
+            }
+            eprintln!(
+                "{case}: no stale pass after round {rounds} ({} runs), another round",
+                ids.len()
+            );
+        };
         stop.store(true, Ordering::SeqCst);
-        assert_eq!(approver.await.unwrap(), runs, "every run approved once");
+        approver.await.unwrap();
         let mut completed = 0;
         for w in workers {
             completed += w.await.unwrap();
         }
         assert_eq!(
             completed,
-            runs,
+            ids.len(),
             "one completion per run: {}",
             answers.summary()
         );
 
-        for id in &ids {
-            assert_eq!(snapshot.status_of(id), Some("completed"), "run {id}");
-            for node in ["approve", "work"] {
-                let done = snapshot
-                    .events_of(id)
-                    .filter(|e| e.kind_type() == "node_completed" && e.node() == Some(node))
-                    .count();
-                assert_eq!(done, 1, "run {id} completed {node} {done} times");
-            }
-        }
         no_violations(&jamjet_testkit::invariants::check_snapshot(&snapshot));
         if backend == Backend::Postgres {
             let audit = snapshot.audit.as_ref().unwrap();
             assert!(
-                audit.entries.len() >= 2 * runs,
+                audit.entries.len() >= 2 * ids.len(),
                 "each run's request and decision are in the chain: {} entries",
                 audit.entries.len()
             );
         }
         let stale = a.count(STALE) + b.count(STALE);
         eprintln!(
-            "{case}: {stale} stale passes ({} on A, {} on B)",
+            "{case}: {stale} stale passes ({} on A, {} on B), {} runs in {rounds} round(s)",
             a.count(STALE),
-            b.count(STALE)
+            b.count(STALE),
+            ids.len()
         );
         assert!(
             stale >= 1,
             "neither scheduler logged a stale pass, so their race never opened"
         );
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }
@@ -371,6 +427,8 @@ async fn two_engines_cancel_and_finish_race_once() {
                 "no staggered cancel landed while its finish was due, so the race \
                  opened only at one phase of the tick"
             );
+            a.assert_no_panics();
+            b.assert_no_panics();
         })
         .await;
     }
@@ -421,6 +479,8 @@ async fn skewed_engine_does_not_reclaim_a_live_lease() {
             .await
             .unwrap();
         assert_eq!(st, 200, "the lease still holds: {body}");
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }
@@ -484,6 +544,8 @@ async fn skewed_engine_does_not_expire_an_approval_early() {
             "the request is no longer pending: {still:?}"
         );
         pool.close().await;
+        a.assert_no_panics();
+        b.assert_no_panics();
     })
     .await;
 }

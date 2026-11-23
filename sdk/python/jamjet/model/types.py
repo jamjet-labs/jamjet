@@ -50,6 +50,13 @@ class ModelResponse:
 
     ``cost_usd`` is ``None`` when the call's cost is not known (a model with no
     price), which is not the same as a call that cost nothing.
+
+    ``usage_reported`` says the backend read the tokens (and the cost, when
+    ``cost_usd`` is set) from the call itself. It is false by default, so a
+    backend that leaves the tokens at 0 has reported nothing: a worker model
+    step then sends no usage, and the engine fails the step closed under a
+    cap rather than count it as free. ``model`` is the model that answered,
+    as the backend reports it, or ``None`` when it does not say.
     """
 
     message: Any
@@ -57,6 +64,8 @@ class ModelResponse:
     output_tokens: int = 0
     cost_usd: float | None = None
     raw: Any = None
+    usage_reported: bool = False
+    model: str | None = None
 
 
 @dataclass

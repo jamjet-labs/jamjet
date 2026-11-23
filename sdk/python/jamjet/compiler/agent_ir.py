@@ -248,6 +248,8 @@ def compile_agent_to_ir(
     prompt: str,
     max_turns: int = 8,
     claim_by_execution: bool = False,
+    *,
+    drive: bool = False,
 ) -> dict[str, Any]:
     """Compile *agent* + *prompt* into a durable agent-loop ``WorkflowIr`` dict.
 
@@ -274,6 +276,14 @@ def compile_agent_to_ir(
         never get these items and the run waits with no error. The run's own
         worker has to call ``POST /work-items/claim`` with ``execution_id``.
         The default output is unchanged.
+    drive:
+        When true, the run's own worker runs its model and tool steps:
+        each model node carries ``"executor": "worker"`` (its item goes to the
+        ``model_worker`` queue, claimed by execution, and the caller's model
+        answers it), and each tool-dispatch node carries
+        ``"claim": "by_execution"``, as with ``claim_by_execution``.
+        ``Agent.run_durable(drive=True)`` compiles this way. The default
+        output is unchanged.
 
     Returns
     -------
@@ -301,7 +311,7 @@ def compile_agent_to_ir(
         # ── Model node: carries tool schemas, reads messages from state. ──────
         nodes[model_id] = _node(
             model_id,
-            _model_kind(model_ref, system_prompt, tool_schemas),
+            _model_kind(model_ref, system_prompt, tool_schemas, worker=drive),
             retry_policy=_MODEL_RETRY_POLICY,
             description=f"agent turn {t} — model call",
             labels={"jamjet.agent.loop": "model", "jamjet.agent.turn": str(t)},
@@ -354,7 +364,7 @@ def compile_agent_to_ir(
                 "tools": tools_map,
             },
         }
-        if claim_by_execution:
+        if claim_by_execution or drive:
             tools_kind["claim"] = "by_execution"
         nodes[tools_id] = _node(
             tools_id,
@@ -377,7 +387,7 @@ def compile_agent_to_ir(
     final_id = f"__model_{max_turns}__"
     nodes[final_id] = _node(
         final_id,
-        _model_kind(model_ref, system_prompt, []),
+        _model_kind(model_ref, system_prompt, [], worker=drive),
         retry_policy=_MODEL_RETRY_POLICY,
         description=f"agent turn {max_turns} — final answer (no tools)",
         labels={
@@ -498,13 +508,23 @@ def _tool_schema(td: ToolDefinition) -> dict[str, Any]:
     }
 
 
-def _model_kind(model_ref: str, system_prompt: str | None, tool_schemas: list[dict[str, Any]]) -> dict[str, Any]:
+def _model_kind(
+    model_ref: str,
+    system_prompt: str | None,
+    tool_schemas: list[dict[str, Any]],
+    *,
+    worker: bool = False,
+) -> dict[str, Any]:
     """A Model node kind. ``tool_schemas=[]`` offers the model no tools.
 
     Empty ``prompt_ref`` => the executor reads the running ``messages`` list from
     state rather than a single templated user prompt.
+
+    ``worker=True`` adds ``"executor": "worker"``. The key is written only then:
+    the engine refuses a null ``executor``, and leaving it out keeps the default
+    graph, and its version, as it was.
     """
-    return {
+    kind: dict[str, Any] = {
         "type": "model",
         "model_ref": model_ref,
         "prompt_ref": "",
@@ -512,6 +532,9 @@ def _model_kind(model_ref: str, system_prompt: str | None, tool_schemas: list[di
         "system_prompt": system_prompt,
         "tools": tool_schemas,
     }
+    if worker:
+        kind["executor"] = "worker"
+    return kind
 
 
 def _content_version(ir: dict[str, Any]) -> str:

@@ -723,6 +723,22 @@ CALLS = [
         {"worker_id": "wk-1", "queue_types": ["python_tool"], "lease_secs": 60},
     ),
     Call(
+        "claim_for_execution",
+        lambda c: c.claim_for_execution(
+            "drive-1", ["python_tool", "model_worker"], "exec_1", node_id="n1", lease_secs=60, wait_ms=10000
+        ),
+        "POST",
+        "/work-items/claim",
+        {
+            "worker_id": "drive-1",
+            "queue_types": ["python_tool", "model_worker"],
+            "execution_id": "exec_1",
+            "node_id": "n1",
+            "lease_secs": 60,
+            "wait_ms": 10000,
+        },
+    ),
+    Call(
         "complete_work_item",
         lambda c: c.complete_work_item(
             "wi-1",
@@ -757,6 +773,30 @@ CALLS = [
         },
     ),
     Call(
+        "complete_model_step",
+        lambda c: c.complete_model_step(
+            "wi-1",
+            {"content": "hi", "finish_reason": "stop", "model": "m", "input_tokens": 1, "output_tokens": 2},
+            lease_fence=3,
+            idempotency_key="k1",
+            duration_ms=7,
+        ),
+        "POST",
+        "/work-items/wi-1/complete",
+        {
+            "lease_fence": 3,
+            "duration_ms": 7,
+            "model_result": {
+                "content": "hi",
+                "finish_reason": "stop",
+                "model": "m",
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+            "idempotency_key": "k1",
+        },
+    ),
+    Call(
         "fail_work_item",
         lambda c: c.fail_work_item("wi-1", "boom", lease_fence=3),
         "POST",
@@ -772,6 +812,14 @@ CALLS = [
     ),
     Call("tick", lambda c: c.tick(budget_ms=5000), "POST", "/ops/tick", {"budget_ms": 5000}),
     Call("engine_features", lambda c: c.engine_features(), "GET", "/health"),
+    Call("require_features", lambda c: c.require_features(), "GET", "/health"),
+    Call(
+        "find_execution",
+        lambda c: c.find_execution("job:1"),
+        "GET",
+        "/executions",
+        params={"run_key": "job:1"},
+    ),
     Call("post", lambda c: c.post("/custom/route", json={"k": "v"}), "POST", "/custom/route", {"k": "v"}),
     Call(
         "get",
@@ -795,6 +843,8 @@ def _answer(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"events": []})
     if path == "/approvals":
         return httpx.Response(200, json={"approvals": [], "next_after": None})
+    if path == "/executions" and "run_key" in request.url.params:
+        return httpx.Response(200, json={"run_key": request.url.params["run_key"], "executions": []})
     return httpx.Response(200, json={"ok": True})
 
 
