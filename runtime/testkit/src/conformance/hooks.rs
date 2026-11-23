@@ -548,8 +548,12 @@ impl StoreHooks for SqliteHooks {
 /// The tables of the Postgres state schema, every one of which
 /// [`StoreHooks::every_row`] reads. The migration log is left out.
 const POSTGRES_TABLES: &[&str] = &[
+    "agents",
     "api_tokens",
     "artifacts",
+    "audit_head",
+    "audit_log",
+    "audit_outbox",
     "dead_letter_items",
     "events",
     "proj_approvals",

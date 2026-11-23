@@ -2,7 +2,7 @@
 //! `proj_approvals` read-model keyed by `(execution_id, node_id)`.
 //!
 //! The projector runs as a background task alongside the scheduler.  Each tick
-//! it: paginates over all running executions (avoiding the 100-execution cap);
+//! it: walks every running execution a keyset page at a time;
 //! for each, reads events since its per-execution checkpoint; folds approval
 //! events into the projection using first-decision-wins semantics (matching the
 //! runtime's canonical fold in `approvals.rs`); seeds prior-tick state from the
@@ -21,10 +21,15 @@
 //!   or `"rejected"` cannot be overwritten by a later decision.  Orphan
 //!   `ApprovalReceived` events (no prior `ToolApprovalRequired`) are ignored.
 //!
-//! - **Full coverage**: `tick()` paginates over all Running executions so the
-//!   100-row default limit cannot silently drop executions beyond the first page.
+//! - **Full coverage**: `tick()` walks all Running executions in id order
+//!   (`list_running_executions_after`). Offset paging skipped a run for each
+//!   run that finished behind the walk.
+//!
+//! - **Forward only**: the backend keeps a stored row or checkpoint that is
+//!   newer than the one written, so a second projector's stale batch never
+//!   moves the read model back.
 
-use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
+use jamjet_core::workflow::ExecutionId;
 use jamjet_state::{
     backend::{ApprovalProjectionRow, BackendResult, StateBackend},
     event::{ApprovalDecision, EventKind},
@@ -49,25 +54,26 @@ impl Projector {
 
     /// One projection pass over all running executions.
     ///
-    /// Paginates over Running executions so the 100-row page limit does not
-    /// silently cap coverage.  Returns the total number of approval rows
+    /// Walks the running executions by id, a page at a time, following the
+    /// backend's cursor until a page scans nothing. Runs that finish during
+    /// the walk do not shift the pages after them, as offset paging did.
+    /// Returns the total number of approval rows
     /// written (for tests and monitoring).  Non-approval events are consumed
     /// and the checkpoint is advanced past them, but they do not contribute to
     /// the returned count.  Per-execution errors are logged and skipped so a
     /// single bad execution does not abort the whole tick.
     pub async fn tick(&self) -> BackendResult<usize> {
-        let page_size: u32 = 100;
-        let mut offset: u32 = 0;
+        const PAGE: u32 = 100;
+        let mut after: Option<String> = None;
         let mut total_applied = 0usize;
 
         loop {
             let page = self
                 .backend
-                .list_executions(Some(WorkflowStatus::Running), page_size, offset)
+                .list_running_executions_after(after.as_deref(), PAGE)
                 .await?;
-            let page_len = page.len();
 
-            for exec in page {
+            for exec in page.executions {
                 match self.project_execution(&exec.execution_id).await {
                     Ok(n) => total_applied += n,
                     Err(e) => {
@@ -79,10 +85,10 @@ impl Projector {
                 }
             }
 
-            if (page_len as u32) < page_size {
-                break;
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
             }
-            offset += page_len as u32;
         }
 
         Ok(total_applied)
@@ -108,8 +114,10 @@ impl Projector {
     /// ### Atomicity
     ///
     /// `apply_approval_projection_batch` writes all changed rows AND the
-    /// checkpoint in one `BEGIN IMMEDIATE` transaction.  If the process crashes
-    /// mid-batch, the next tick re-reads from the old checkpoint and re-applies.
+    /// checkpoint in one transaction.  If the process crashes mid-batch, the
+    /// next tick re-reads from the old checkpoint and re-applies. A batch
+    /// another projector has overtaken changes nothing: each row and the
+    /// checkpoint only move forward.
     async fn project_execution(&self, execution_id: &ExecutionId) -> BackendResult<usize> {
         let cp = self
             .backend

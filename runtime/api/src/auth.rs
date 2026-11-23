@@ -111,6 +111,11 @@ pub async fn require_auth(
             Json(json!({ "error": "invalid or expired token" })),
         )
             .into_response(),
+        // The store could not be reached (a database restart): 503 with
+        // Retry-After, so a client tries again instead of giving up.
+        Err(jamjet_state::StateBackendError::Unavailable(e)) => {
+            crate::error::ApiError::Unavailable(format!("auth error: {e}")).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("auth error: {e}") })),

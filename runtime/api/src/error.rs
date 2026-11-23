@@ -70,6 +70,17 @@ impl From<jamjet_state::backend::StateBackendError> for ApiError {
     }
 }
 
+/// An audit log that could not be reached answers 503 with `Retry-After`,
+/// as the state store does; any other audit error is a 500.
+impl From<jamjet_audit::AuditError> for ApiError {
+    fn from(e: jamjet_audit::AuditError) -> Self {
+        match e {
+            jamjet_audit::AuditError::Unavailable(msg) => Self::Unavailable(msg),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

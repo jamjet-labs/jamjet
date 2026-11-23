@@ -120,7 +120,8 @@ pub(crate) fn classify(e: &sqlx::Error, at_commit: bool) -> Retry {
 
 /// The answer to a statement's error outside any transaction, as a read
 /// runs: what [`classify`] says, and `Unavailable` where it would retry.
-pub(crate) fn statement_error(e: sqlx::Error) -> StateBackendError {
+/// Public so the Postgres audit log answers the same errors the same way.
+pub fn statement_error(e: sqlx::Error) -> StateBackendError {
     match classify(&e, false) {
         Retry::Never(answer) => answer,
         Retry::Again { .. } => StateBackendError::Unavailable(e.to_string()),

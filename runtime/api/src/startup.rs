@@ -325,7 +325,7 @@ pub fn existing_database_url(config: &ApiConfig) -> String {
         })
 }
 
-/// Which store the server will open.
+/// The store a server or a command runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreKind {
     Memory,
@@ -333,14 +333,32 @@ pub enum StoreKind {
     Postgres,
 }
 
-/// `STORAGE_BACKEND=memory` wins; `postgres://` or `postgresql://` is
-/// Postgres; anything else is SQLite.
-pub fn store_kind(storage_backend: &str, database_url: &str) -> StoreKind {
-    if storage_backend == "memory" {
-        return StoreKind::Memory;
+impl StoreKind {
+    /// The name the startup log gives it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
     }
-    let url = database_url.trim_start().to_ascii_lowercase();
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+}
+
+/// Whether `url` names a Postgres database: it starts `postgres://` or
+/// `postgresql://`, in any case.
+pub fn is_postgres_url(url: &str) -> bool {
+    let url = url.trim_start().as_bytes();
+    [b"postgres://".as_slice(), b"postgresql://".as_slice()]
+        .iter()
+        .any(|scheme| url.len() >= scheme.len() && url[..scheme.len()].eq_ignore_ascii_case(scheme))
+}
+
+/// The store `STORAGE_BACKEND` and the database URL select:
+/// `STORAGE_BACKEND=memory` wins, then a Postgres URL, then SQLite.
+pub fn store_kind(storage_backend: Option<&str>, database_url: &str) -> StoreKind {
+    if storage_backend == Some("memory") {
+        StoreKind::Memory
+    } else if is_postgres_url(database_url) {
         StoreKind::Postgres
     } else {
         StoreKind::Sqlite
@@ -395,8 +413,8 @@ pub fn check_store_for_platform(
 /// any store is opened and before [`database_url`] creates `.jamjet`.
 pub fn check_store_env(config: &ApiConfig) -> anyhow::Result<()> {
     let platform = on_serverless_platform(|k| std::env::var(k).ok());
-    let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
-    let kind = store_kind(&storage_backend, &existing_database_url(config));
+    let storage_backend = std::env::var("STORAGE_BACKEND").ok();
+    let kind = store_kind(storage_backend.as_deref(), &existing_database_url(config));
     let allow = env_flag(ALLOW_EPHEMERAL_STORE_ENV)?;
     match check_store_for_platform(platform, kind, allow) {
         StoreCheck::Ok => Ok(()),
@@ -506,9 +524,69 @@ pub fn shutdown_plan_from_env() -> anyhow::Result<ShutdownPlan> {
     shutdown_plan(get, platform).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// `url` as a message may show it. A Postgres URL loses its user, password
+/// and query (which can hold a password too), keeping the host, port and
+/// database; any other URL is shown as it is.
+pub fn shown_url(url: &str) -> String {
+    if !is_postgres_url(url) {
+        return url.to_string();
+    }
+    let Some((scheme, rest)) = url.trim_start().split_once("://") else {
+        return "a Postgres database".to_string();
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}{path}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_postgres_url_selects_postgres_and_memory_still_wins() {
+        for url in [
+            "postgres://u:p@db:5432/jamjet",
+            "postgresql://db/jamjet",
+            "POSTGRES://db/jamjet",
+        ] {
+            assert!(is_postgres_url(url), "{url}");
+            assert_eq!(store_kind(None, url), StoreKind::Postgres, "{url}");
+            assert_eq!(store_kind(Some("memory"), url), StoreKind::Memory);
+        }
+        for url in [
+            "sqlite://.jamjet/runtime.db",
+            "sqlite:///var/lib/postgres://x.db",
+            "postgres:/db",
+            "",
+        ] {
+            assert!(!is_postgres_url(url), "{url}");
+            assert_eq!(store_kind(None, url), StoreKind::Sqlite, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_shown_postgres_url_has_no_credentials() {
+        assert_eq!(
+            shown_url(
+                "postgres://jj:s3cret@db.internal:5432/jamjet?password=other&sslmode=require"
+            ),
+            "postgres://db.internal:5432/jamjet"
+        );
+        assert_eq!(
+            shown_url("postgresql://jj:p@ss@word@db/jamjet"),
+            "postgresql://db/jamjet"
+        );
+        assert_eq!(shown_url("postgres://db"), "postgres://db");
+        assert_eq!(
+            shown_url("sqlite://.jamjet/runtime.db"),
+            "sqlite://.jamjet/runtime.db"
+        );
+    }
 
     #[test]
     fn zero_and_false_turn_a_flag_off() {
@@ -829,7 +907,7 @@ mod tests {
     #[test]
     fn sqlite_on_a_platform_is_refused() {
         for url in ["sqlite://data/runtime.db", "", "sqlite::memory:"] {
-            let kind = store_kind("", url);
+            let kind = store_kind(None, url);
             assert_eq!(kind, StoreKind::Sqlite, "{url:?}");
             match check_store_for_platform(true, kind, false) {
                 StoreCheck::Refuse(msg) => {
@@ -847,7 +925,7 @@ mod tests {
             check_store_for_platform(true, StoreKind::Sqlite, true),
             StoreCheck::Warn(_)
         ));
-        let kind = store_kind("memory", "postgres://h/db");
+        let kind = store_kind(Some("memory"), "postgres://h/db");
         assert_eq!(kind, StoreKind::Memory);
         assert!(matches!(
             check_store_for_platform(true, kind, false),
@@ -858,7 +936,7 @@ mod tests {
     #[test]
     fn postgres_on_a_platform_and_anything_off_it_is_ok() {
         for url in ["postgres://u@h/db", "postgresql://u@h/db"] {
-            let kind = store_kind("", url);
+            let kind = store_kind(None, url);
             assert_eq!(kind, StoreKind::Postgres, "{url}");
             assert_eq!(check_store_for_platform(true, kind, false), StoreCheck::Ok);
         }

@@ -234,60 +234,71 @@ impl AuditEnricher {
     /// Under the chain lock for the whole read-head -> seal -> append ->
     /// advance-head sequence, so this process's appends form one line. Another
     /// process may append to the same log (`jamjet-server token create`
-    /// beside the server): the append is linked
-    /// ([`AuditBackend::append_linked`]), and one that finds the head moved
-    /// re-reads it and seals again. `created_at` is set at each seal, after
-    /// the head's, so the order entries are listed in (`created_at`) is the
-    /// chain's order.
-    async fn seal_and_append(&self, mut entry: AuditLogEntry) -> Result<(), String> {
+    /// beside the server, or another engine on one Postgres database): the
+    /// append is linked ([`AuditBackend::append_linked`]) onto the head this
+    /// writer last appended, and one that finds the head moved seals again
+    /// through [`AuditBackend::append_sealed`], which reads the head itself.
+    /// `created_at` is set at each seal, after the head's, so the order
+    /// entries are listed in (`created_at`) is the chain's order.
+    async fn seal_and_append(&self, entry: AuditLogEntry) -> Result<(), String> {
         const ATTEMPTS: usize = 8;
         let built_at = entry.created_at;
         let expires_at = entry.expires_at;
-        let mut chain = self.chain.lock().await;
-        for attempt in 0..ATTEMPTS {
-            if !chain.seeded || attempt > 0 {
-                // An unreadable head is an error, not an empty log: linking
-                // the entry to nothing would break the chain here.
-                let head = self
-                    .backend
-                    .head_at()
-                    .await
-                    .map_err(|e| format!("audit log head unreadable: {e}"))?;
-                (chain.head, chain.head_at) = match head {
-                    Some((hash, at)) => (hash, Some(at)),
-                    None => (None, None),
-                };
-                chain.seeded = true;
-            }
+        let seal = |head: Option<String>,
+                    head_at: Option<chrono::DateTime<chrono::Utc>>,
+                    clock: chrono::DateTime<chrono::Utc>| {
             // Dated after the head even when this clock is behind it (it
             // stepped back, or another writer's runs ahead), so the listing
             // order stays the chain's order. A head far in the future pins
             // every entry's date to it until this clock catches up: said
             // loudly, since the dates then say nothing about when.
-            let clock = chrono::Utc::now();
-            if let Some(ahead) = chain.head_at.and_then(|at| head_far_ahead(at, clock)) {
+            if let Some(ahead) = head_at.and_then(|at| head_far_ahead(at, clock)) {
                 warn!(
                     ahead_secs = ahead.num_seconds(),
                     "the audit log's newest entry is dated ahead of this clock; new entries \
                      are dated just after it until the clock catches up"
                 );
             }
-            let now = match chain.head_at {
+            let now = match head_at {
                 Some(at) => clock.max(at + chrono::Duration::microseconds(1)),
                 None => clock,
             };
+            let mut entry = entry.clone();
             entry.created_at = now;
             entry.expires_at = expires_at.map(|e| e + (now - built_at));
-            entry.seal(chain.head.clone(), &self.signer);
-            match self.backend.append_linked(entry.clone()).await {
+            entry.seal(head, &self.signer);
+            entry
+        };
+        let mut chain = self.chain.lock().await;
+        if chain.seeded {
+            let clock = self
+                .backend
+                .now()
+                .await
+                .map_err(|e| format!("audit clock unreadable: {e}"))?;
+            let entry = seal(chain.head.clone(), chain.head_at, clock);
+            let next = (entry.entry_hash.clone(), entry.created_at);
+            match self.backend.append_linked(entry).await {
                 // Advance the head only after a durable append, so a failed
                 // write never leaves a gap the next entry would link past.
                 Ok(true) => {
-                    chain.head = entry.entry_hash.clone();
-                    chain.head_at = Some(entry.created_at);
+                    (chain.head, chain.head_at) = (next.0, Some(next.1));
                     return Ok(());
                 }
-                Ok(false) => continue,
+                Ok(false) => {}
+                Err(e) => return Err(format!("audit log write failed: {e}")),
+            }
+        }
+        for _ in 0..ATTEMPTS {
+            // An unreadable head is an error, not an empty log: linking the
+            // entry to nothing would break the chain here.
+            match self.backend.append_sealed(&seal).await {
+                Ok(Some((head, head_at))) => {
+                    (chain.head, chain.head_at) = (head, Some(head_at));
+                    chain.seeded = true;
+                    return Ok(());
+                }
+                Ok(None) => continue,
                 Err(e) => return Err(format!("audit log write failed: {e}")),
             }
         }

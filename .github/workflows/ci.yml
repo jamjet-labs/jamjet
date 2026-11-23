@@ -90,6 +90,15 @@ jobs:
         run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - name: Test
         run: cargo test --workspace --locked
+      # The restart cases restart the Postgres service under every test on
+      # it, so they run alone, after the rest. Without the container name
+      # they skip; this step requires it.
+      - name: Name the Postgres container
+        run: echo "JAMJET_TEST_POSTGRES_CONTAINER=${{ job.services.postgres.id }}" >> "$GITHUB_ENV"
+      - name: Test a Postgres restart
+        env:
+          JAMJET_REQUIRE_RESTART_TESTS: "1"
+        run: cargo test -p jamjet-api --locked --test pg_restart -- --test-threads=1
 
   # The jobs above build with default features, so engram's `rerank` (ONNX
   # Runtime through `ort`) is otherwise compiled only by clippy and never run.
@@ -414,6 +423,12 @@ jobs:
       - name: Create web/dist placeholder for rust-embed
         run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - run: cargo build --release --workspace --locked
+      # The fault points and the test clock are a test feature of
+      # jamjet-state. A release build that has them carries this name.
+      - name: No test hooks in the release binary
+        run: |
+          if strings target/release/jamjet-server | grep -q JAMJET_TEST_CRASH_AT; then
+            echo "::error::the release binary contains test hooks"; exit 1; fi
 
   # ── Wheel build check ───────────────────────────────────────────────
   wheel-check:

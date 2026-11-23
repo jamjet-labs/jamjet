@@ -8,9 +8,12 @@
 //!   per backend, the cases, and [`conformance_suite!`], which runs every
 //!   case on one backend.
 //! - [`pg::TestDatabase`] gives a test a Postgres database of its own.
+//! - [`invariants::check`] reads a store's database and names every rule
+//!   of the engine's log, queue and audit chain it breaks.
 
 pub mod conformance;
 pub mod intercept;
+pub mod invariants;
 pub mod pg;
 
 pub use intercept::{Hooks, Intercept, NoHooks, Op};

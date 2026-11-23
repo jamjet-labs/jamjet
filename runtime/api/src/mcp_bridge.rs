@@ -514,7 +514,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 // mirroring the REST approve path: best-effort, after the
                 // durable event write, off the worker's fenced commit path.
                 // A repeat appended nothing and was sealed the first time.
-                if !submitted.repeat {
+                if !submitted.repeat && crate::routes::before_decision_seal().await.is_ok() {
                     let audit_ctx = jamjet_audit::RequestContext {
                         actor_id,
                         actor_type: jamjet_audit::ActorType::Human,

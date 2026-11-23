@@ -759,7 +759,8 @@ async fn list_waiting_for(
     let page = backend
         .list_running_executions_after(params.after.as_deref(), limit)
         .await?;
-    let now = Utc::now();
+    // The store's clock, as the approve routes judge a deadline.
+    let now = backend.store_now().await?;
     let mut executions = Vec::new();
     for execution in page.executions {
         if crate::waiting::waiting_for(backend, &execution, now).await? != Some(wanted) {
@@ -796,7 +797,8 @@ pub(crate) async fn execution_view(
     backend: &dyn jamjet_state::StateBackend,
     execution: WorkflowExecution,
 ) -> Result<Value, ApiError> {
-    let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let now = backend.store_now().await?;
+    let waiting = crate::waiting::waiting_for(backend, &execution, now).await?;
     let execution_id = execution.execution_id.clone();
     let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)
@@ -1186,7 +1188,7 @@ async fn approve_execution(
     // The per-node worker events emitted through the fenced `commit_turn` path
     // are not yet routed through the enricher; tracked as F-t3-audit-emit.
     // A repeat appended nothing, and its decision was sealed the first time.
-    if !submitted.repeat {
+    if !submitted.repeat && before_decision_seal().await.is_ok() {
         let ctx = jamjet_audit::RequestContext {
             actor_id,
             actor_type: jamjet_audit::ActorType::Human,
@@ -1207,6 +1209,16 @@ async fn approve_execution(
     Ok(Json(
         crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
+}
+
+/// The seam between a decision's durable append and its inline seal, on
+/// this route and on the MCP approve tool. An error a test arms here skips
+/// the seal, as an engine that stopped there would: the decision is
+/// recorded and has no audit entry, which on Postgres the outbox drain then
+/// seals.
+pub(crate) async fn before_decision_seal() -> jamjet_state::BackendResult<()> {
+    jamjet_state::fault_point!("decision.after_append_before_seal", 1);
+    Ok(())
 }
 
 /// The answer of `POST /executions/:id/approve` to a refused decision.
@@ -1234,6 +1246,7 @@ fn submit_refusal(e: crate::approvals::SubmitError) -> ApiError {
         | SubmitError::ChoiceNotAllowed(_)
         | SubmitError::BadNote(_) => ApiError::BadRequest(e.to_string()),
         SubmitError::Backend(msg) => ApiError::Internal(msg),
+        SubmitError::Unavailable(_) => ApiError::Unavailable(e.to_string()),
     }
 }
 
@@ -1793,17 +1806,8 @@ async fn list_audit_log(
         to: None,
     };
 
-    let total = state
-        .audit
-        .count(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let entries = state
-        .audit
-        .query(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let total = state.audit.count(&q).await?;
+    let entries = state.audit.query(&q).await?;
 
     Ok(Json(json!({
         "items": entries,

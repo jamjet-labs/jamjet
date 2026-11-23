@@ -65,3 +65,7 @@ libsqlite3-sys = { workspace = true }
 base64 = "0.22"
 # Path only, no version: cargo drops it when it packages this crate.
 jamjet-testkit = { path = "../testkit" }
+# jamjet-state's fault points, for this crate's tests only (see
+# runtime/testkit/Cargo.toml). Path-only, so cargo drops it when it packages
+# this crate.
+jamjet-state = { path = "../state", features = ["test-hooks"] }
