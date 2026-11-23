@@ -1,6 +1,6 @@
 //! The Postgres server restarts under the engines.
 //!
-//! These cases run `docker restart` on the container
+//! These cases stop and start, or restart, the Docker container
 //! `JAMJET_TEST_POSTGRES_CONTAINER` names, which must be the server
 //! `JAMJET_TEST_POSTGRES_URL` points at: its published port is checked
 //! first. A restart cuts every other test on that server, so CI runs this
@@ -9,8 +9,8 @@
 //! is set, as on that CI step: then a missing variable fails them.
 //!
 //! One case needs no server: [`an_unreachable_store_answers_503`] fails
-//! the store's calls in process, so the 503 the restart case can only meet
-//! by timing is met on every run.
+//! the store's calls in process, so the 503 the engines' restart case can
+//! only meet by timing is met on every run.
 #![cfg(unix)]
 
 #[path = "support/engine.rs"]
@@ -94,6 +94,52 @@ fn restart(container: String) -> std::thread::JoinHandle<std::process::Output> {
     })
 }
 
+/// Run `docker <args>` to the end and panic unless it succeeds.
+async fn docker(args: &[&str]) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(&args)
+            .output()
+            .expect("run docker")
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "docker failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A stopped test server. Dropping it starts the container again, so a
+/// case that fails while the server is down does not leave it down for the
+/// cases after it.
+struct Stopped(String);
+
+impl Stopped {
+    async fn stop(container: String) -> Self {
+        docker(&["stop", "-t", "1", &container]).await;
+        Self(container)
+    }
+
+    async fn start(mut self) {
+        let container = std::mem::take(&mut self.0);
+        docker(&["start", &container]).await;
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new("docker")
+            .args(["start", &self.0])
+            .output();
+    }
+}
+
 fn restarted(out: std::process::Output) {
     assert!(
         out.status.success(),
@@ -126,9 +172,14 @@ async fn server_ready() {
     }
 }
 
-/// The server restarts under a pool of the store: while it is down, calls
-/// answer `Unavailable` and nothing else, and once it is back they succeed
-/// on the same store, with no reconnect by the caller.
+/// The server stops and starts again under a pool of the store. While it
+/// is down, calls answer `Unavailable` and nothing else; once it is back
+/// they succeed on the same store, with no reconnect by the caller.
+///
+/// The case stops the server and calls while it is stopped, instead of
+/// calling through a `docker restart`: the pool drops a dead idle
+/// connection and opens a new one, retrying a refused connection until the
+/// acquire timeout, so a restart shorter than that is never seen by a call.
 #[tokio::test]
 async fn the_pool_reconnects_after_a_restart() {
     let Some(container) = container("the_pool_reconnects_after_a_restart") else {
@@ -138,9 +189,10 @@ async fn the_pool_reconnects_after_a_restart() {
     let Some(db) = TestDatabase::fresh().await else {
         return jamjet_testkit::skip("the_pool_reconnects_after_a_restart");
     };
+    let acquire_timeout = Duration::from_secs(1);
     let settings = PgSettings {
         pool_size: 3,
-        acquire_timeout: Duration::from_secs(1),
+        acquire_timeout,
         ..PgSettings::default()
     };
     let b = PgBackend::connect(db.url(), settings).await.unwrap();
@@ -190,31 +242,41 @@ async fn the_pool_reconnects_after_a_restart() {
     )
     .await
     .unwrap();
+    // The pool holds a live connection when the server goes away.
+    assert!(b.get_execution(&run).await.unwrap().is_some());
 
-    let restart = restart(container);
-    let mut unavailable = 0;
+    let stopped = Stopped::stop(container).await;
+    // The first call meets the pool's dead connection, the next ones find
+    // no server to connect to. Each answers within a few acquire timeouts.
+    for call in 1..=3 {
+        let answer = tokio::time::timeout(acquire_timeout * 5, b.get_execution(&run))
+            .await
+            .unwrap_or_else(|_| panic!("call {call} with the server down did not answer"));
+        match answer {
+            Err(StateBackendError::Unavailable(_)) => {}
+            other => panic!("call {call} with the server down answered {other:?}"),
+        }
+    }
+
+    stopped.start().await;
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut back = false;
-    while Instant::now() < deadline {
+    let back = loop {
         match b.get_execution(&run).await {
             Ok(found) => {
                 assert!(found.is_some(), "the run is gone after the restart");
-                if restart.is_finished() && unavailable > 0 {
-                    back = true;
-                    break;
-                }
+                break true;
             }
-            Err(StateBackendError::Unavailable(_)) => unavailable += 1,
-            Err(other) => panic!("a call during the restart answered {other:?}"),
+            Err(StateBackendError::Unavailable(_)) => {}
+            Err(other) => panic!("a call while the server came back answered {other:?}"),
+        }
+        if Instant::now() >= deadline {
+            break false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    restarted(restart.join().unwrap());
-    server_ready().await;
-    assert!(unavailable > 0, "no call saw the server down");
+    };
     assert!(
         back,
-        "the store did not work again within 60 s of the restart"
+        "the store did not work again within 60 s of the server starting"
     );
     let item = b.claim_work_item("w1", &["work"]).await.unwrap();
     assert!(item.is_some(), "a claim after the restart");
