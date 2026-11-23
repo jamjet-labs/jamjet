@@ -21,7 +21,7 @@ use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, warn, Instrument};
 use uuid::Uuid;
 
 /// Executor for `a2a_task` workflow nodes.
@@ -94,7 +94,9 @@ impl NodeExecutor for A2aTaskExecutor {
             "jamjet.a2a.skill" = %skill,
             "jamjet.a2a.task_id" = %task_id,
         );
-        let _a2a_guard = a2a_span.enter();
+        // Not entered with a guard: this fn awaits, and a guard held across an
+        // `.await` leaves the span on the stack of the thread that entered it
+        // after the task has moved on. The calls that wait carry the span.
 
         // Build the message using the published crate's types.
         let mut metadata_map = HashMap::new();
@@ -126,6 +128,7 @@ impl NodeExecutor for A2aTaskExecutor {
         let submitted = self
             .client
             .send_message(agent_uri, request)
+            .instrument(a2a_span.clone())
             .await
             .map_err(|e| format!("A2A task submission failed: {e}"))?;
 
@@ -139,12 +142,13 @@ impl NodeExecutor for A2aTaskExecutor {
             }
         };
 
-        debug!(task_id = %response_task_id, "A2A task submitted");
+        debug!(parent: &a2a_span, task_id = %response_task_id, "A2A task submitted");
 
         // Poll until completion.
         let final_task = self
             .client
             .wait_for_completion(agent_uri, &response_task_id, self.poll_interval, None)
+            .instrument(a2a_span.clone())
             .await
             .map_err(|e| format!("A2A task polling failed: {e}"))?;
 
@@ -186,7 +190,7 @@ impl NodeExecutor for A2aTaskExecutor {
             A2aTaskState::InputRequired => {
                 // The workflow should be paused for user input — return error
                 // so the retry mechanism handles re-submission.
-                warn!(task_id = %response_task_id, "A2A task requires input — not yet handled");
+                warn!(parent: &a2a_span, task_id = %response_task_id, "A2A task requires input — not yet handled");
                 Err("A2A task requires input — multi-turn not yet supported in this node".into())
             }
             other => Err(format!("A2A task ended in unexpected state: {other:?}").into()),
