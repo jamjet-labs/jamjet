@@ -38,7 +38,7 @@ async fn status_version_commit_and_features() {
         "{source}"
     );
     assert_eq!(body["commit"].is_null(), source == "none");
-    // A stranger sees these five keys and no more.
+    // A stranger sees these seven keys and no more.
     let mut keys: Vec<&str> = body
         .as_object()
         .unwrap()
@@ -48,9 +48,21 @@ async fn status_version_commit_and_features() {
     keys.sort();
     assert_eq!(
         keys,
-        ["commit", "commit_source", "features", "status", "version"]
+        [
+            "background",
+            "commit",
+            "commit_source",
+            "features",
+            "status",
+            "tick_overdue",
+            "version"
+        ]
     );
     assert_eq!(body["features"], json!(FEATURES));
+    // A router built without a watch has the loops on, the default, and so
+    // nothing to be overdue (tests/ops_status.rs has the rest).
+    assert_eq!(body["background"], "on");
+    assert_eq!(body["tick_overdue"], Value::Null);
 }
 
 #[tokio::test]

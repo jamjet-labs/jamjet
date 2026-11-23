@@ -23,6 +23,10 @@
 //! Nothing an advance does reaches the caller as an error. A failure is
 //! logged and counted in the [`AdvanceReport`]: the write that led to it has
 //! already committed, and the tick will go on from the log.
+//!
+//! [`TickWatch`] notices when nobody ticks: with the loops off and no tick
+//! for three intervals, `/health` says `tick_overdue: true` and requests
+//! write an error line saying what has stopped.
 
 use crate::routes::Draining;
 use crate::startup::Background;
@@ -105,6 +109,8 @@ pub struct Driver {
     /// Whether the engine's own loops run beside this driver, as the tick's
     /// report says.
     background: Background,
+    /// Told when a tick of this driver has finished and saved its state.
+    watch: Option<Arc<TickWatch>>,
 }
 
 impl Driver {
@@ -144,6 +150,7 @@ impl Driver {
             outbox: None,
             tick_lock: Arc::new(tokio::sync::Mutex::new(())),
             background: Background::Off,
+            watch: None,
         }
     }
 
@@ -164,6 +171,13 @@ impl Driver {
     /// Whether the engine's loops run beside this driver.
     pub fn background(&self) -> Background {
         self.background
+    }
+
+    /// Tell `watch` when a tick of this driver has finished and saved its
+    /// state, so `/health` stops calling the tick overdue at once.
+    pub fn with_watch(mut self, watch: Arc<TickWatch>) -> Self {
+        self.watch = Some(watch);
+        self
     }
 
     /// The scheduler every pass of this driver goes through.
@@ -619,7 +633,13 @@ impl Driver {
             report: serde_json::to_value(&report).unwrap_or(serde_json::Value::Null),
         };
         match self.backend.finish_tick(&holder, &outcome).await {
-            Ok(true) => {}
+            // Only a finish the store saved: a tick it did not record is one
+            // no other engine sees either.
+            Ok(true) => {
+                if let Some(watch) = &self.watch {
+                    watch.tick_finished();
+                }
+            }
             Ok(false) => warn!("tick lease lost: another tick took over before this one finished"),
             Err(e) => warn!("tick: its state could not be saved: {e}"),
         }
@@ -831,6 +851,297 @@ enum Step {
 /// Eight hex characters, enough to tell two workers or two instances apart.
 fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+// ── Request-driven mode: noticing that nobody ticks ─────────────────────────
+
+/// How often a [`TickWatch`] reads the tick row and writes its error line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchTiming {
+    /// 30 s. The requests in between answer from what the last read found.
+    pub read_every: Duration,
+    /// 5 minutes: at most one error line per window, per process.
+    pub log_every: Duration,
+    /// 2 s. A read that takes longer counts as a store that could not be
+    /// read, so `/health` never waits long on a store that hangs.
+    pub read_timeout: Duration,
+}
+
+impl Default for WatchTiming {
+    fn default() -> Self {
+        Self {
+            read_every: Duration::from_secs(30),
+            log_every: Duration::from_secs(300),
+            read_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Notices when nobody ticks an engine whose loops are off.
+///
+/// With the loops off a tick is the only thing that expires approvals,
+/// reclaims lapsed leases and runs the engine's own steps, and when the
+/// caller that should tick stops, nothing else fails. A tick is overdue when
+/// the last one finished more than three tick intervals ago, or when none has
+/// finished and this process has been up for longer than that. `/health` says
+/// so in `tick_overdue`, and while it is overdue any request writes one error
+/// line, at most once per [`WatchTiming::log_every`].
+///
+/// The tick row is read at most once per [`WatchTiming::read_every`], with
+/// the store's clock, so the age is taken on the clock that stamped it. A
+/// tick this process finishes tells the watch at once; one another engine
+/// finishes is seen at the next read. With the loops on nothing is overdue
+/// and nothing is read.
+pub struct TickWatch {
+    backend: Arc<dyn StateBackend>,
+    background: Background,
+    interval: Duration,
+    timing: WatchTiming,
+    up_since: Instant,
+    /// What the last read found, or what a tick of this process told it.
+    seen: std::sync::Mutex<Option<Seen>>,
+    /// A request is reading the row now. The others do not wait for it.
+    reading: AtomicBool,
+    /// When the error line was last written.
+    logged_at: std::sync::Mutex<Option<Instant>>,
+}
+
+/// What the watch knows about the tick row, and since when.
+#[derive(Clone, Copy)]
+struct Seen {
+    at: Instant,
+    /// `None`: the row or the store's clock could not be read.
+    found: Option<Found>,
+}
+
+#[derive(Clone, Copy)]
+struct Found {
+    last_finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The store's clock less this process's, at the read.
+    clock_offset: chrono::Duration,
+}
+
+/// The turn to read the row: one request at a time holds it, and dropping it
+/// (a request that ends or is dropped mid-read) gives it back.
+struct Turn<'a>(&'a AtomicBool);
+
+impl<'a> Turn<'a> {
+    fn take(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn locked<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl TickWatch {
+    /// A watch on `backend`, the unscoped store, for an engine whose loops are
+    /// as `background` says and whose caller ticks every `interval`. The
+    /// process counts as up from here.
+    pub fn new(backend: Arc<dyn StateBackend>, background: Background, interval: Duration) -> Self {
+        Self {
+            backend,
+            background,
+            interval,
+            timing: WatchTiming::default(),
+            up_since: Instant::now(),
+            seen: std::sync::Mutex::new(None),
+            reading: AtomicBool::new(false),
+            logged_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Other windows than the defaults, for a test that cannot wait minutes.
+    pub fn with_timing(mut self, timing: WatchTiming) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    /// Whether the engine's loops are on, as `main` decided.
+    pub fn background(&self) -> Background {
+        self.background
+    }
+
+    /// How often the engine's caller is expected to tick.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Whether a tick is overdue: `None` with the loops on, or when the store
+    /// could not be read.
+    pub async fn overdue(&self) -> Option<bool> {
+        let since = self.since_last_tick().await?;
+        Some(self.is_overdue(since))
+    }
+
+    /// [`overdue`](Self::overdue), and the error line when it is, at most
+    /// once per window. Every request calls it ([`watch_ticks`]).
+    pub async fn check(&self) -> Option<bool> {
+        let since = self.since_last_tick().await?;
+        let overdue = self.is_overdue(since);
+        if overdue && self.may_log() {
+            tracing::error!(
+                "no tick for {} s while the background loops are off: approvals do not \
+                 expire, lapsed leases are not reclaimed, engine steps do not run",
+                since.as_secs()
+            );
+        }
+        Some(overdue)
+    }
+
+    /// The tick row as the store holds it now, read past the window, which
+    /// it then starts again: what the watch says next follows this read.
+    pub async fn status(&self) -> jamjet_state::BackendResult<Option<jamjet_state::TickStatus>> {
+        match self.read().await {
+            Ok((row, clock_offset)) => {
+                self.remember(Some(Found {
+                    last_finished_at: row.as_ref().and_then(|r| r.last_finished_at),
+                    clock_offset,
+                }));
+                Ok(row)
+            }
+            Err(e) => {
+                self.remember(None);
+                Err(e)
+            }
+        }
+    }
+
+    /// A tick of this process has finished and the store has saved it: it
+    /// is not overdue now, whatever the last read found.
+    pub fn tick_finished(&self) {
+        let mut seen = locked(&self.seen);
+        let clock_offset = seen
+            .and_then(|s| s.found)
+            .map_or_else(chrono::Duration::zero, |f| f.clock_offset);
+        *seen = Some(Seen {
+            at: seen.map_or_else(Instant::now, |s| s.at),
+            found: Some(Found {
+                last_finished_at: Some(jamjet_state::clock::process_now() + clock_offset),
+                clock_offset,
+            }),
+        });
+    }
+
+    fn is_overdue(&self, since: Duration) -> bool {
+        since > self.interval.saturating_mul(3)
+    }
+
+    /// How long since the last tick finished, on the store's clock, or since
+    /// this process started when none has.
+    async fn since_last_tick(&self) -> Option<Duration> {
+        if self.background == Background::On {
+            return None;
+        }
+        let found = self.found().await?;
+        Some(match found.last_finished_at {
+            Some(at) => (jamjet_state::clock::process_now() + found.clock_offset - at)
+                .to_std()
+                .unwrap_or(Duration::ZERO),
+            None => self.up_since.elapsed(),
+        })
+    }
+
+    /// What the last read found, read again once the window has passed.
+    async fn found(&self) -> Option<Found> {
+        if let Some(seen) = self.fresh() {
+            return seen.found;
+        }
+        // One request reads; one that comes meanwhile answers from what the
+        // last read found rather than wait.
+        let Some(_turn) = Turn::take(&self.reading) else {
+            return locked(&self.seen).and_then(|s| s.found);
+        };
+        // A read may have ended between the look above and the turn.
+        if let Some(seen) = self.fresh() {
+            return seen.found;
+        }
+        let found = self.read().await.ok().map(|(row, clock_offset)| Found {
+            last_finished_at: row.and_then(|r| r.last_finished_at),
+            clock_offset,
+        });
+        self.remember(found)
+    }
+
+    fn fresh(&self) -> Option<Seen> {
+        locked(&self.seen).filter(|s| s.at.elapsed() < self.timing.read_every)
+    }
+
+    /// The row and the store's clock, within the read timeout.
+    async fn read(
+        &self,
+    ) -> jamjet_state::BackendResult<(Option<jamjet_state::TickStatus>, chrono::Duration)> {
+        let read = async {
+            let row = self.backend.tick_status().await?;
+            let store_now = self.backend.store_now().await?;
+            Ok((row, store_now - jamjet_state::clock::process_now()))
+        };
+        match tokio::time::timeout(self.timing.read_timeout, read).await {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(e)) => {
+                debug!("tick watch: the tick state could not be read: {e}");
+                Err(e)
+            }
+            Err(_) => {
+                debug!("tick watch: the tick state was not read within the timeout");
+                Err(StateBackendError::Unavailable(format!(
+                    "the tick state was not read within {:?}",
+                    self.timing.read_timeout
+                )))
+            }
+        }
+    }
+
+    /// Keep what a read found, from now. A tick this process finished while
+    /// the read was out is newer than what the read saw, so it is kept.
+    fn remember(&self, found: Option<Found>) -> Option<Found> {
+        let mut seen = locked(&self.seen);
+        let local = seen.and_then(|s| s.found).and_then(|f| f.last_finished_at);
+        let found = found.map(|f| Found {
+            last_finished_at: f.last_finished_at.max(local),
+            ..f
+        });
+        *seen = Some(Seen {
+            at: Instant::now(),
+            found,
+        });
+        found
+    }
+
+    fn may_log(&self) -> bool {
+        let mut logged_at = locked(&self.logged_at);
+        if logged_at.is_some_and(|at| at.elapsed() < self.timing.log_every) {
+            return false;
+        }
+        *logged_at = Some(Instant::now());
+        true
+    }
+}
+
+/// Put `watch` on `router`: every request checks it before it is served, so
+/// any request writes the error line while a tick is overdue, and `/health`
+/// and `GET /ops/status` find it in the request's extensions.
+pub fn watch_ticks(router: axum::Router, watch: Arc<TickWatch>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(watch, check_ticks))
+}
+
+async fn check_ticks(
+    axum::extract::State(watch): axum::extract::State<Arc<TickWatch>>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    watch.check().await;
+    req.extensions_mut().insert(watch);
+    next.run(req).await
 }
 
 #[cfg(test)]

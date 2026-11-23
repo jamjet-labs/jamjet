@@ -368,6 +368,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Says when nobody ticks an engine whose loops are off: `/health` reports
+    // it and any request logs it, at most every 5 minutes. It exists in every
+    // mode, so `/health` says `background` whatever the mode; with the loops
+    // on it reads nothing.
+    let tick_watch = Arc::new(jamjet_api::driver::TickWatch::new(
+        state.backend.clone(),
+        background,
+        background_plan.driver.tick_interval,
+    ));
     // The driver answers `POST /ops/tick`: it runs the engine's own steps, so
     // it exists wherever this process can (the loops off, dev mode or the
     // embedded workers). An engine with the loops on and no workers of its
@@ -379,7 +388,8 @@ async fn main() -> anyhow::Result<()> {
             shutdown.clone(),
             background_plan.driver,
         )
-        .with_background(background);
+        .with_background(background)
+        .with_watch(tick_watch.clone());
         Arc::new(match postgres {
             Some(pg) => driver.with_outbox(pg),
             None => driver,
@@ -437,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
         Some(driver) => router.layer(axum::Extension(driver)),
         None => router,
     };
+    let router = jamjet_api::driver::watch_ticks(router, tick_watch);
     // Dev mode answers only requests addressed to this machine (or a name in
     // JAMJET_DEV_ALLOWED_HOSTS), not relayed and not cross-site, on any bind:
     // see `startup::dev_refusal`.

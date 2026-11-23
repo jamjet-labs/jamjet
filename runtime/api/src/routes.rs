@@ -108,6 +108,9 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         // The tick: what the engine's loops would do, once, on request. Operator
         // only outside dev mode, and POST only: it makes the engine act.
         .route("/ops/tick", operator_only(post(ops_tick), dev_mode))
+        // What the last tick did, and whether one is overdue. It changes
+        // nothing, so any role may read it.
+        .route("/ops/status", get(ops_status))
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         // Coordinator decisions and agent search
@@ -193,14 +196,26 @@ async fn inject_dev_tenant(
 /// `status` never changes: the dev stack's probe reads it. `commit` is what
 /// this binary was built from (a local build from a changed tree reports HEAD),
 /// `features` what it can do that an older engine could not.
-async fn health() -> Json<Value> {
+///
+/// `background` is `on` or `off`, as `main` decided; a router built without a
+/// [`TickWatch`](crate::driver::TickWatch) has the loops on, the default.
+/// `tick_overdue` says whether a tick is overdue with the loops off: `null`
+/// with them on, or when the store could not be read. An overdue tick does
+/// not change `status`: the process still serves.
+async fn health(watch: Option<Extension<std::sync::Arc<crate::driver::TickWatch>>>) -> Json<Value> {
     let commit = env!("JAMJET_COMMIT");
+    let (background, tick_overdue) = match &watch {
+        Some(Extension(watch)) => (watch.background(), watch.overdue().await),
+        None => (crate::startup::Background::On, None),
+    };
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "commit": if commit.is_empty() { Value::Null } else { json!(commit) },
         "commit_source": env!("JAMJET_COMMIT_SOURCE"),
         "features": crate::features::FEATURES,
+        "background": background.label(),
+        "tick_overdue": tick_overdue,
     }))
 }
 
@@ -5472,6 +5487,55 @@ async fn ops_tick(
         .into_response()),
         TickResult::Stopping => Err(ApiError::Unavailable("shutting down".into())),
     }
+}
+
+/// `GET /ops/status` — the tick row as the store holds it now: who holds the
+/// lease and until when, when the last tick began and when the last finished
+/// one finished, whether it got through, where the next one resumes
+/// (`next_after`), and that tick's report as `POST /ops/tick` answered it.
+/// `tick` is `null` until a tick has begun. Beside it, what `/health` says:
+/// `background`, `tick_overdue`, and the interval the overdue rule counts in.
+///
+/// Any authenticated role may read it. A store that cannot be read answers
+/// as its error does (503 with `Retry-After`, or 500).
+async fn ops_status(
+    State(state): State<AppState>,
+    watch: Option<Extension<std::sync::Arc<crate::driver::TickWatch>>>,
+) -> Result<Json<Value>, ApiError> {
+    let (row, background, tick_overdue, interval) = match &watch {
+        Some(Extension(watch)) => (
+            watch.status().await?,
+            watch.background(),
+            watch.overdue().await,
+            Some(watch.interval().as_secs()),
+        ),
+        None => (
+            state.backend.tick_status().await?,
+            crate::startup::Background::On,
+            None,
+            None,
+        ),
+    };
+    let at = |t: Option<chrono::DateTime<Utc>>| {
+        t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let tick = row.map(|row| {
+        json!({
+            "holder": row.holder,
+            "lease_until": at(row.lease_until),
+            "last_started_at": at(row.last_started_at),
+            "last_finished_at": at(row.last_finished_at),
+            "last_complete": row.last_complete,
+            "next_after": row.cursor,
+            "last_report": row.last_report,
+        })
+    });
+    Ok(Json(json!({
+        "background": background.label(),
+        "tick_interval_secs": interval,
+        "tick_overdue": tick_overdue,
+        "tick": tick,
+    })))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
