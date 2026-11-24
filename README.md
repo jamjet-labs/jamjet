@@ -135,7 +135,7 @@ Real providers need `jamjet[model]` as well.
 
 Engine 0.6 and Python SDK 0.14 let a crew of agents run as jobs on a serverless container platform such as Cloud Run, with the engine beside them on Postgres. We built these pieces for an agent crew moving to Cloud Run and Cloud SQL.
 
-Each stage of the crew is one agent. A job starts its run and works the run's steps itself. When a person has to decide, the job exits. Started again with the same key, it picks up the same run.
+Each stage of the crew is one agent. A job starts its run and works the run's steps itself. When a person has to decide, the job exits, and it also exits when another worker holds a step for too long. Started again with the same key, it picks up the same run.
 
 ```python
 # job.py: one stage of the crew. Run it as a job, and again after a decision.
@@ -153,7 +153,7 @@ async def main() -> int:
         )
     except RunWaiting as w:
         print(f"waiting for {w.waiting_for} on {w.execution_id}")
-        return 0  # not a failure: start the job again after the decision
+        return 0  # not a failure: start the job again later with the same key
     print(result.output)
     return 0
 
@@ -173,7 +173,7 @@ After `jamjet approve`, the same job with the same key finishes that run. `jamje
 | A retried job must not start a second run | A start with the same `run_key` returns the run the first start made |
 | No worker fleet to keep alive | With `drive=True`, the process that starts the run claims its tool and model steps |
 | Model calls through your own router | `model=Model(backend=...)` sends each call to your router. The engine still holds the answer to the run's model allow list and caps |
-| Spend that cannot run away | `token_budget` and `cost_budget_usd` per run. The next step that would spend past a cap is refused and the run fails |
+| A ceiling on spend | `token_budget` and `cost_budget_usd` per run. At a cap, the next step that can spend is refused and the run fails. Steps already running finish, so a run can end above its cap by those |
 | A reviewer who picks, not only approves | `options` on a `human_approval` node. The choice and the note are sealed into the audit log and written to `state.__approvals`, so a condition can route on them |
 | An app that shows what is waiting | `GET /approvals`, or `client.list_pending_approvals()`, lists pending approvals across runs |
 | Nothing running between requests | `JAMJET_BACKGROUND=off` turns the engine's loops off, and a scheduler calls `POST /ops/tick` |
