@@ -53,7 +53,7 @@ sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls-aws-lc-rs",
 libsqlite3-sys = { version = ">=0.39.0", default-features = false }
 
 # HTTP / gRPC
-axum = { version = "0.7", features = ["json", "macros"] }
+axum = { version = "0.8", features = ["json", "macros"] }
 hyper = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
