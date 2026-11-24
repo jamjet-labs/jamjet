@@ -6,6 +6,7 @@
 /// `tests/health.rs` that exercises it.
 pub const FEATURES: &[&str] = &[
     "claim_by_execution",
+    "ops_tick",
     "python_fn_by_execution",
     "run_key",
     "worker_model_steps",

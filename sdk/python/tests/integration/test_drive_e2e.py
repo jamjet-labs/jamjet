@@ -807,36 +807,36 @@ class _Stoppable:
 
 @pytest.mark.skipif(os.environ.get("JAMJET_E2E_REQUEST_DRIVEN") != "1", reason="needs request-driven mode")
 def test_drive_on_a_request_driven_engine(tmp_path: Path, servers: list[Any]) -> None:
+    from jamjet.client import JamjetClient
+
     e = Engine(os.environ["JAMJET_SERVER_PATH"], tmp_path / "engine", JAMJET_BACKGROUND="off", JAMJET_EMBED_CRON="0")
     servers.append(e)
     e.start()
-    assert "ops_tick" in e.get("/health")["features"]
+    health = e.get("/health")
+    assert health["background"] == "off", health
+    assert "ops_tick" in health["features"], health
     assert "background loops are off" in e.log_text()
     router = Router()
     servers.append(router)
 
-    ticks: list[dict[str, Any]] = []
-    stop = threading.Event()
-
-    def ticker() -> None:
-        with httpx.Client(base_url=e.url, timeout=30) as client:
-            while not stop.wait(0.2):
-                r = client.post("/ops/tick", json={})
-                r.raise_for_status()
-                ticks.append(r.json())
-
-    thread = threading.Thread(target=ticker, daemon=True)
-    thread.start()
-    try:
-        done = run_within(180, drive_once(e.url, router.url, run_key="drive-e2e:ticked"))
-    finally:
-        stop.set()
-        thread.join(timeout=30)
+    # Nothing ticks during the drive. Every step is the driver's, and the
+    # engine takes the run on after each of its writes, so it needs no tick.
+    done = run_within(180, drive_once(e.url, router.url, run_key="drive-e2e:request-driven"))
 
     assert done["output"] == ANSWER
     assert_each_node_completed_once(e, done["execution_id"])
-    assert ticks and any(t.get("ran") for t in ticks), ticks
     assert set(router.charges.values()) == {1} and len(router.charges) == 2, router.charges
+
+    async def tick_once() -> dict[str, Any]:
+        async with JamjetClient(e.url) as client:
+            return await client.tick()
+
+    # A tick after the drive runs, and finds nothing left to do.
+    tick = run_within(60, tick_once())
+    assert (tick["ran"], tick["complete"], tick["background"]) == (True, True, "off"), tick
+    assert tick["runs"] == {"visited": 0, "advanced": 0, "stale_passes": 0, "errors": 0}, tick
+    assert tick["engine_steps"] == {"quick": 0, "slow": 0}, tick
+    assert tick["next_after"] is None, tick
 
 
 def _fake_token(n: int) -> str:

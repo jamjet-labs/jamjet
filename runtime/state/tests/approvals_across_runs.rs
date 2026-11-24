@@ -439,9 +439,41 @@ async fn the_pending_list_reads_its_index_in_order() {
 // ── A backend that keeps the defaults ─────────────────────────────────────────
 
 /// The real in-memory backend behind every required method, and the trait's
-/// defaults for the two this lane adds: an implementor outside the repo that
-/// has not written them.
+/// defaults for the methods it may leave out: an implementor outside the
+/// repo that has not written them.
 struct OnTheDefaults(InMemoryBackend);
+
+/// The tick methods' defaults refuse, naming why, while the store behind
+/// them keeps tick state: a store without them cannot pass for one where no
+/// tick holds the lease.
+#[tokio::test]
+async fn a_backend_without_tick_state_refuses_to_coordinate_ticks() {
+    use jamjet_state::{TickBegin, TickOutcome};
+    let b = OnTheDefaults(InMemoryBackend::new());
+    let lease = Duration::from_secs(60);
+    assert!(matches!(
+        b.0.begin_tick("engine-a:1", lease).await.unwrap(),
+        TickBegin::Began { .. }
+    ));
+    let outcome = TickOutcome {
+        cursor: None,
+        complete: true,
+        report: json!({}),
+    };
+    let refusals = [
+        b.begin_tick("engine-b:1", lease).await.map(drop),
+        b.finish_tick("engine-a:1", &outcome).await.map(drop),
+        b.tick_status().await.map(drop),
+        b.renew_tick("engine-a:1", lease).await.map(drop),
+    ];
+    for refused in refusals {
+        assert!(
+            matches!(&refused, Err(jamjet_state::StateBackendError::Database(m))
+                if m.contains("cannot coordinate ticks")),
+            "{refused:?}"
+        );
+    }
+}
 
 /// With a waiting request and an open item in the store, both methods still
 /// refuse rather than answer an empty list.

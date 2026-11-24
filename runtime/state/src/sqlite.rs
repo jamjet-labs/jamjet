@@ -98,9 +98,13 @@ impl SqliteBackend {
         }))
     }
 
-    /// Run embedded migrations against the connected database.
+    /// Run embedded migrations against the connected database, then create
+    /// the tick table, which is kept outside them so an older build still
+    /// opens the file.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
-        sqlx::migrate!("./migrations").run(&self.pool).await
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        ensure_tick_table(&self.pool).await?;
+        Ok(())
     }
 
     /// Convenience: connect and immediately run migrations.
@@ -2597,6 +2601,32 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<Option<FailOutcome>> {
         fail_work_item_fenced_recorded_in(&self.pool, None, item_id, lease_fence, error).await
     }
+
+    // ── Request-driven mode ───────────────────────────────────────────────
+
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<crate::backend::TickBegin> {
+        begin_tick_in(&self.pool, holder, lease).await
+    }
+
+    async fn finish_tick(
+        &self,
+        holder: &str,
+        outcome: &crate::backend::TickOutcome,
+    ) -> BackendResult<bool> {
+        finish_tick_in(&self.pool, holder, outcome).await
+    }
+
+    async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
+        tick_status_in(&self.pool).await
+    }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        renew_tick_in(&self.pool, holder, lease).await
+    }
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
@@ -4258,6 +4288,172 @@ pub(crate) async fn patch_append_array_in(
     Ok(())
 }
 
+// ── Request-driven mode ───────────────────────────────────────────────────────
+
+/// The tick row's table, which [`SqliteBackend::migrate`] creates after the
+/// migrations and outside them. sqlx's migrator refuses a file that holds a
+/// migration it does not know, so as a migration this table would stop
+/// every older build from opening the file, and a rollback would have to
+/// throw the file away. An older build ignores a table it does not know.
+const TICK_TABLE: &str = "CREATE TABLE IF NOT EXISTS engine_ticks (\
+    name TEXT PRIMARY KEY NOT NULL, holder TEXT, lease_until TEXT, last_started_at TEXT, \
+    last_finished_at TEXT, last_complete INTEGER, cursor TEXT, last_report TEXT)";
+
+/// Create the tick table if the file has none.
+pub(crate) async fn ensure_tick_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(TICK_TABLE).execute(pool).await.map(drop)
+}
+
+/// A stored tick time, `None` when the column is null.
+fn tick_time(row: &sqlx::sqlite::SqliteRow, column: &str) -> BackendResult<Option<DateTime<Utc>>> {
+    let text: Option<String> = row.try_get(column).map_err(map_db_err)?;
+    text.as_deref().map(parse_datetime).transpose()
+}
+
+/// [`StateBackend::begin_tick`] for both SQLite backends, in one `BEGIN
+/// IMMEDIATE` transaction on this process's clock: the row is read under
+/// the write lock, and written only when the lease is free or lapsed. The
+/// tick row is the store's, not a tenant's, so the tenant-scoped backend
+/// calls this on its pool as it is.
+pub(crate) async fn begin_tick_in(
+    pool: &SqlitePool,
+    holder: &str,
+    lease: std::time::Duration,
+) -> BackendResult<crate::backend::TickBegin> {
+    use crate::backend::TickBegin;
+    let lease = crate::backend::tick_lease(lease)?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let row = sqlx::query(
+        "SELECT holder, lease_until, cursor, last_finished_at FROM engine_ticks \
+         WHERE name = 'tick'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
+    fault_point!("sqlite.begin_tick", 1);
+    let now = crate::clock::process_now();
+    let (mut cursor, mut last_finished_at) = (None, None);
+    if let Some(row) = row {
+        let held: Option<String> = row.try_get("holder").map_err(map_db_err)?;
+        if let (Some(holder), Some(lease_until)) = (held, tick_time(&row, "lease_until")?) {
+            if lease_until > now {
+                // Nothing written: the transaction rolls back on drop.
+                return Ok(TickBegin::Busy {
+                    holder,
+                    lease_until,
+                });
+            }
+        }
+        cursor = row.try_get("cursor").map_err(map_db_err)?;
+        last_finished_at = tick_time(&row, "last_finished_at")?;
+    }
+    sqlx::query(
+        "INSERT INTO engine_ticks (name, holder, lease_until, last_started_at) \
+         VALUES ('tick', ?, ?, ?) \
+         ON CONFLICT (name) DO UPDATE SET holder = excluded.holder, \
+           lease_until = excluded.lease_until, last_started_at = excluded.last_started_at",
+    )
+    .bind(holder)
+    .bind((now + lease).to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
+    fault_point!("sqlite.begin_tick", 2);
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(TickBegin::Began {
+        cursor,
+        last_finished_at,
+    })
+}
+
+/// [`StateBackend::finish_tick`] for both SQLite backends: one update that
+/// names its holder, in a `BEGIN IMMEDIATE` transaction.
+pub(crate) async fn finish_tick_in(
+    pool: &SqlitePool,
+    holder: &str,
+    outcome: &crate::backend::TickOutcome,
+) -> BackendResult<bool> {
+    let report = serde_json::to_string(&outcome.report)?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let done = sqlx::query(
+        "UPDATE engine_ticks SET holder = NULL, lease_until = NULL, last_finished_at = ?, \
+           last_complete = ?, cursor = ?, last_report = ? \
+         WHERE name = 'tick' AND holder = ?",
+    )
+    .bind(crate::clock::process_now().to_rfc3339())
+    .bind(outcome.complete)
+    .bind(outcome.cursor.as_deref())
+    .bind(report)
+    .bind(holder)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_err)?
+    .rows_affected();
+    fault_point!("sqlite.finish_tick", 1);
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(done == 1)
+}
+
+/// [`StateBackend::renew_tick`] for both SQLite backends: one update that
+/// names its holder, in a `BEGIN IMMEDIATE` transaction, on this process's
+/// clock as the begin is.
+pub(crate) async fn renew_tick_in(
+    pool: &SqlitePool,
+    holder: &str,
+    lease: std::time::Duration,
+) -> BackendResult<bool> {
+    let lease = crate::backend::tick_lease(lease)?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let done =
+        sqlx::query("UPDATE engine_ticks SET lease_until = ? WHERE name = 'tick' AND holder = ?")
+            .bind((crate::clock::process_now() + lease).to_rfc3339())
+            .bind(holder)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected();
+    fault_point!("sqlite.renew_tick", 1);
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(done == 1)
+}
+
+/// [`StateBackend::tick_status`] for both SQLite backends.
+pub(crate) async fn tick_status_in(
+    pool: &SqlitePool,
+) -> BackendResult<Option<crate::backend::TickStatus>> {
+    let row = sqlx::query(
+        "SELECT holder, lease_until, last_started_at, last_finished_at, last_complete, \
+           cursor, last_report \
+         FROM engine_ticks WHERE name = 'tick'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(map_db_err)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let report: Option<String> = row.try_get("last_report").map_err(map_db_err)?;
+    Ok(Some(crate::backend::TickStatus {
+        holder: row.try_get("holder").map_err(map_db_err)?,
+        lease_until: tick_time(&row, "lease_until")?,
+        last_started_at: tick_time(&row, "last_started_at")?,
+        last_finished_at: tick_time(&row, "last_finished_at")?,
+        last_complete: row.try_get("last_complete").map_err(map_db_err)?,
+        last_report: report.as_deref().map(serde_json::from_str).transpose()?,
+        cursor: row.try_get("cursor").map_err(map_db_err)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4817,5 +5013,48 @@ mod tests {
             assert!(again.is_none(), "{tenant:?}: {again:?}");
             assert_eq!(db.get_events(&eid).await.unwrap().len(), before + 2);
         }
+    }
+
+    /// The tick table is made at open, outside the migrator, so a build
+    /// whose migrator has never heard of it still opens a file this build
+    /// wrote. The older build is simulated by this build's migrator with
+    /// every migration that names the table left out, run with sqlx's
+    /// default `ignore_missing = false`: a migration it lacks would stop it.
+    #[tokio::test]
+    async fn sqlite_tick_table_is_not_a_migration() {
+        let dir = std::env::temp_dir().join(format!("jamjet_ticks_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}", dir.join("state.db").display());
+        let backend = SqliteBackend::open(&url).await.unwrap();
+        let begun = backend
+            .begin_tick("engine-a:1", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(
+            matches!(begun, crate::backend::TickBegin::Began { .. }),
+            "{begun:?}"
+        );
+
+        let this_build = sqlx::migrate!("./migrations");
+        let older: Vec<sqlx::migrate::Migration> = this_build
+            .iter()
+            .filter(|m| !m.sql.as_str().contains("engine_ticks"))
+            .cloned()
+            .collect();
+        let mut older = sqlx::migrate::Migrator::with_migrations(older);
+        older.set_ignore_missing(false);
+        older
+            .run(&backend.pool())
+            .await
+            .expect("a build without the tick table opens the file");
+        this_build.run(&backend.pool()).await.unwrap();
+
+        let ticks: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_ticks")
+            .fetch_one(&backend.pool())
+            .await
+            .unwrap();
+        assert_eq!(ticks, 1, "the file holds the tick row");
+        backend.pool().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

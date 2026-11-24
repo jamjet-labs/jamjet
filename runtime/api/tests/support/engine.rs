@@ -53,6 +53,8 @@ pub struct TestStore {
     pub developer: String,
     /// Decides approvals.
     pub reviewer: String,
+    /// Ticks an engine that has its loops off (`POST /ops/tick`).
+    pub operator: String,
 }
 
 impl Drop for TestStore {
@@ -115,6 +117,7 @@ impl TestStore {
         };
         let developer = token("developer").await;
         let reviewer = token("reviewer").await;
+        let operator = token("operator").await;
         TestStore {
             backend,
             dir,
@@ -123,6 +126,7 @@ impl TestStore {
             db,
             developer,
             reviewer,
+            operator,
         }
     }
 
@@ -156,6 +160,251 @@ impl TestStore {
     /// The SQLite file, `None` on Postgres.
     pub fn file(&self) -> Option<&Path> {
         self.file.as_deref()
+    }
+}
+
+// ── Time a test moves on, in the store ──────────────────────────────────────
+
+/// The tick row as the store holds it.
+#[derive(Debug, Clone)]
+pub struct TickRow {
+    pub holder: Option<String>,
+    /// How long the lease has left on the store's clock: `lease_until` less
+    /// the store's now. `None` when no lease is held.
+    pub lease_left: Option<chrono::Duration>,
+    pub cursor: Option<String>,
+    pub last_complete: Option<bool>,
+}
+
+async fn sqlite_conn(file: &Path) -> sqlx::SqliteConnection {
+    use sqlx::Connection;
+    sqlx::SqliteConnection::connect(&format!("sqlite://{}", file.display()))
+        .await
+        .unwrap()
+}
+
+/// A time the SQLite store wrote, as RFC 3339.
+fn stored_time(text: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .unwrap_or_else(|e| panic!("a stored time that does not parse: {text:?}: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+impl TestStore {
+    /// The tick row, `None` before the first tick took the lease.
+    pub async fn tick_row(&self) -> Option<TickRow> {
+        use sqlx::Row;
+        match self.file() {
+            Some(file) => {
+                let mut conn = sqlite_conn(file).await;
+                let row = sqlx::query(
+                    "SELECT holder, lease_until, cursor, last_complete FROM engine_ticks \
+                     WHERE name = 'tick'",
+                )
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+                let _ = sqlx::Connection::close(conn).await;
+                // The SQLite store takes the lease on this machine's clock.
+                row.map(|r| TickRow {
+                    holder: r.get("holder"),
+                    lease_left: r
+                        .get::<Option<String>, _>("lease_until")
+                        .map(|until| stored_time(&until) - chrono::Utc::now()),
+                    cursor: r.get("cursor"),
+                    last_complete: r.get("last_complete"),
+                })
+            }
+            None => {
+                let pool = self.database().unwrap().pool().await;
+                let row = sqlx::query(
+                    "SELECT holder, \
+                       (EXTRACT(EPOCH FROM (lease_until - statement_timestamp())) * 1000)::bigint \
+                         AS left_ms, \
+                       cursor, last_complete FROM engine_ticks WHERE name = 'tick'",
+                )
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                pool.close().await;
+                row.map(|r| TickRow {
+                    holder: r.get("holder"),
+                    lease_left: r
+                        .get::<Option<i64>, _>("left_ms")
+                        .map(chrono::Duration::milliseconds),
+                    cursor: r.get("cursor"),
+                    last_complete: r.get("last_complete"),
+                })
+            }
+        }
+    }
+
+    /// End the tick lease, as if the time its holder took had passed: how
+    /// many rows held one.
+    pub async fn lapse_tick_lease(&self) -> u64 {
+        match self.file() {
+            Some(file) => {
+                let mut conn = sqlite_conn(file).await;
+                let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+                let done = sqlx::query(
+                    "UPDATE engine_ticks SET lease_until = ? \
+                     WHERE name = 'tick' AND holder IS NOT NULL",
+                )
+                .bind(past)
+                .execute(&mut conn)
+                .await
+                .unwrap()
+                .rows_affected();
+                let _ = sqlx::Connection::close(conn).await;
+                done
+            }
+            None => {
+                let pool = self.database().unwrap().pool().await;
+                let done = sqlx::query(
+                    "UPDATE engine_ticks SET lease_until = statement_timestamp() - interval '1 second' \
+                     WHERE name = 'tick' AND holder IS NOT NULL",
+                )
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+                pool.close().await;
+                done
+            }
+        }
+    }
+
+    /// Move the end of every claimed item's lease back by `by`: how many
+    /// items.
+    pub async fn push_back_leases(&self, by: Duration) -> u64 {
+        self.push_back("work_items", "lease_expires_at", "status = 'claimed'", by)
+            .await
+    }
+
+    /// Move the time every retry waits for back by `by`: how many items.
+    pub async fn push_back_retries(&self, by: Duration) -> u64 {
+        self.push_back("work_items", "retry_after", "status = 'pending'", by)
+            .await
+    }
+
+    /// Move the end of every reservation of an effect's idempotency key back
+    /// by `by`: how many. A step that died before its write committed leaves
+    /// its reservation until it runs out, so a retry does not run the effect
+    /// again while the first attempt might still be running.
+    pub async fn push_back_reservations(&self, by: Duration) -> u64 {
+        self.push_back("tool_reservations", "expires_at", "TRUE", by)
+            .await
+    }
+
+    /// `column` of the rows of `table` that match `filter`, moved back by
+    /// `by`. All three are the callers' literals.
+    async fn push_back(
+        &self,
+        table: &'static str,
+        column: &'static str,
+        filter: &'static str,
+        by: Duration,
+    ) -> u64 {
+        let by_chrono = chrono::Duration::from_std(by).unwrap();
+        match self.file() {
+            Some(file) => {
+                let mut conn = sqlite_conn(file).await;
+                let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT rowid, {column} FROM {table} WHERE {filter} AND {column} IS NOT NULL"
+                )))
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+                for (row, at) in &rows {
+                    // The format the store writes, so its text comparisons hold.
+                    let moved = (stored_time(at) - by_chrono).to_rfc3339();
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "UPDATE {table} SET {column} = ? WHERE rowid = ?"
+                    )))
+                    .bind(moved)
+                    .bind(row)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                }
+                let _ = sqlx::Connection::close(conn).await;
+                rows.len() as u64
+            }
+            None => {
+                let pool = self.database().unwrap().pool().await;
+                let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET {column} = {column} - make_interval(secs => $1) \
+                     WHERE {filter} AND {column} IS NOT NULL"
+                )))
+                .bind(by.as_secs_f64())
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+                pool.close().await;
+                done
+            }
+        }
+    }
+
+    /// Move the deadline (`expires_at`, and `escalate_at` where set) of every
+    /// approval request in the store back by `by`, in each request's
+    /// recorded context: how many requests.
+    pub async fn push_back_deadlines(&self, by: Duration) -> u64 {
+        let by = chrono::Duration::from_std(by).unwrap();
+        let moved = |kind: &str| -> String {
+            let mut kind: Value = serde_json::from_str(kind).unwrap();
+            for key in ["expires_at", "escalate_at"] {
+                if let Some(at) = kind["context"][key].as_str() {
+                    let at = stored_time(at) - by;
+                    kind["context"][key] =
+                        Value::String(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                }
+            }
+            kind.to_string()
+        };
+        match self.file() {
+            Some(file) => {
+                let mut conn = sqlite_conn(file).await;
+                let rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT id, kind_json FROM events \
+                     WHERE kind_json LIKE '%\"type\":\"tool_approval_required\"%'",
+                )
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+                for (id, kind) in &rows {
+                    sqlx::query("UPDATE events SET kind_json = ? WHERE id = ?")
+                        .bind(moved(kind))
+                        .bind(id)
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                }
+                let _ = sqlx::Connection::close(conn).await;
+                rows.len() as u64
+            }
+            None => {
+                let pool = self.database().unwrap().pool().await;
+                let rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT id::text, kind_json FROM events \
+                     WHERE kind_type = 'tool_approval_required'",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                for (id, kind) in &rows {
+                    sqlx::query("UPDATE events SET kind_json = $1 WHERE id = $2::uuid")
+                        .bind(moved(kind))
+                        .bind(id)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+                pool.close().await;
+                rows.len() as u64
+            }
+        }
     }
 }
 
@@ -254,6 +503,17 @@ impl Drop for Engine {
 
 /// The variable that arms a fault point in an engine.
 pub const CRASH_AT: &str = "JAMJET_TEST_CRASH_AT";
+/// The variable that arms a hang at a fault point in an engine, as
+/// `label#step=<ms>`.
+pub const HANG_AT: &str = "JAMJET_TEST_HANG_AT";
+
+/// What an engine with its background loops off is started with. A tick may
+/// run three engine steps at once: the harness's Postgres pool holds five
+/// connections, and startup refuses a tick that could take them all.
+pub const LOOPS_OFF: [(&str, &str); 2] = [
+    ("JAMJET_BACKGROUND", "off"),
+    ("JAMJET_TICK_ENGINE_CONCURRENCY", "3"),
+];
 
 impl Engine {
     /// Start an engine on `store` with its scheduler, embedded workers and
@@ -345,6 +605,18 @@ impl Engine {
         self.log.lock().unwrap().matches(needle).count()
     }
 
+    /// Whether the engine prints `needle` within `within`.
+    pub async fn printed(&self, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while !self.log.lock().unwrap().contains(needle) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
     /// What the process printed for each panic of one of its threads: the
     /// line that says where, and the message under it. Its stdout and stderr
     /// are read apart, so the log lines in between (JSON) are skipped.
@@ -405,9 +677,29 @@ impl Engine {
     /// Start the engine again on the same store with the same settings,
     /// without a fault point armed.
     pub async fn restart(&mut self) {
+        self.restart_with(&[]).await;
+    }
+
+    /// [`restart`](Self::restart), with `env` set on top (a clock skew, say).
+    pub async fn restart_with(&mut self, env: &[(&str, &str)]) {
         self.kill();
-        self.env.retain(|(k, _)| k != CRASH_AT);
+        self.env.retain(|(k, _)| k != CRASH_AT && k != HANG_AT);
+        for (k, v) in env {
+            self.env.retain(|(have, _)| have != k);
+            self.env.push((k.to_string(), v.to_string()));
+        }
         self.spawn().await;
+    }
+
+    /// Send SIGTERM, the signal a platform sends before it stops an
+    /// instance. [`exited`](Self::exited) says how it ended.
+    pub fn terminate(&self) {
+        let child = self.child.as_ref().expect("the engine is running");
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill -TERM {}", child.id());
     }
 
     /// How the process ended, if it ends within `within`.
@@ -552,6 +844,50 @@ pub fn work_only(id: &str) -> Value {
         json!({ "work": python_step("work") }),
         vec![json!({ "from": "work", "to": "end", "condition": null })],
     )
+}
+
+/// A `python_fn` node a worker claims over HTTP.
+pub fn python(id: &str) -> Value {
+    python_step(id)
+}
+
+/// A `condition` node with no branches: the engine runs it and goes on.
+pub fn condition(id: &str) -> Value {
+    json!({
+        "id": id, "kind": { "type": "condition", "branches": [] },
+        "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+    })
+}
+
+/// A `human_approval` node the engine runs, whose request expires after
+/// `timeout_secs` if given, to `fallback` if given.
+pub fn approval_node(id: &str, timeout_secs: Option<u64>, fallback: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "kind": {
+            "type": "human_approval", "description": "Go ahead?",
+            "timeout_secs": timeout_secs, "fallback_node": fallback
+        },
+        "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+    })
+}
+
+/// The workflow `id` from `start` over `nodes` and `edges`, with an edge to
+/// the end from every node no edge leads out of.
+pub fn graph(id: &str, start: &str, nodes: Vec<Value>, edges: &[(&str, &str)]) -> Value {
+    let mut all: Vec<Value> = edges
+        .iter()
+        .map(|(from, to)| json!({ "from": from, "to": to, "condition": null }))
+        .collect();
+    let mut by_id = serde_json::Map::new();
+    for node in nodes {
+        let id = node["id"].as_str().unwrap().to_string();
+        if !edges.iter().any(|(from, _)| *from == id) {
+            all.push(json!({ "from": id, "to": "end", "condition": null }));
+        }
+        by_id.insert(id, node);
+    }
+    workflow(id, start, Value::Object(by_id), all)
 }
 
 pub async fn register(client: &reqwest::Client, base: &str, token: &str, ir: &Value) {
@@ -739,6 +1075,25 @@ pub async fn complete(
         })),
     )
     .await
+}
+
+/// `POST /ops/tick` with `token` and no budget of its own.
+pub async fn tick(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<(u16, Value), reqwest::Error> {
+    call(client, base, "POST", "/ops/tick", token, Some(json!({}))).await
+}
+
+/// A tick that must run: its report.
+pub async fn tick_ran(client: &reqwest::Client, base: &str, token: &str) -> Value {
+    let (st, report) = tick(client, base, token)
+        .await
+        .unwrap_or_else(|e| panic!("POST /ops/tick on {base}: {e}"));
+    assert_eq!(st, 200, "{report}");
+    assert_eq!(report["ran"], true, "the tick did not run: {report}");
+    report
 }
 
 /// Report `item` failed, with its fence.

@@ -8,7 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The source trees that may hold `fault_point!` calls, under `runtime/`.
-const TREES: &[&str] = &["state/src", "scheduler/src", "audit/src", "api/src"];
+const TREES: &[&str] = &[
+    "state/src",
+    "scheduler/src",
+    "audit/src",
+    "api/src",
+    "workers/src",
+];
 
 const CALL: &str = "fault_point!(";
 

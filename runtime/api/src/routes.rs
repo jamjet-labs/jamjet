@@ -105,6 +105,12 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             "/tenants/:id",
             operator_only(get(get_tenant).put(update_tenant), dev_mode),
         )
+        // The tick: what the engine's loops would do, once, on request. Operator
+        // only outside dev mode, and POST only: it makes the engine act.
+        .route("/ops/tick", operator_only(post(ops_tick), dev_mode))
+        // What the last tick did, and whether one is overdue. It changes
+        // nothing, so any role may read it.
+        .route("/ops/status", get(ops_status))
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         // Coordinator decisions and agent search
@@ -190,14 +196,26 @@ async fn inject_dev_tenant(
 /// `status` never changes: the dev stack's probe reads it. `commit` is what
 /// this binary was built from (a local build from a changed tree reports HEAD),
 /// `features` what it can do that an older engine could not.
-async fn health() -> Json<Value> {
+///
+/// `background` is `on` or `off`, as `main` decided; a router built without a
+/// [`TickWatch`](crate::driver::TickWatch) has the loops on, the default.
+/// `tick_overdue` says whether a tick is overdue with the loops off: `null`
+/// with them on, or when the store could not be read. An overdue tick does
+/// not change `status`: the process still serves.
+async fn health(watch: Option<Extension<std::sync::Arc<crate::driver::TickWatch>>>) -> Json<Value> {
     let commit = env!("JAMJET_COMMIT");
+    let (background, tick_overdue) = match &watch {
+        Some(Extension(watch)) => (watch.background(), watch.overdue().await),
+        None => (crate::startup::Background::On, None),
+    };
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "commit": if commit.is_empty() { Value::Null } else { json!(commit) },
         "commit_source": env!("JAMJET_COMMIT_SOURCE"),
         "features": crate::features::FEATURES,
+        "background": background.label(),
+        "tick_overdue": tick_overdue,
     }))
 }
 
@@ -449,6 +467,8 @@ async fn start_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let key = crate::run_key::StartKey::from_request(body.run_key, body.reuse)?;
@@ -457,7 +477,7 @@ async fn start_execution(
     let initiated_by = token
         .as_ref()
         .map(|Extension(t)| crate::auth::principal_of(t));
-    start_run(
+    let started = start_run(
         &state,
         &tenant_id,
         body.workflow_id,
@@ -466,7 +486,18 @@ async fn start_execution(
         initiated_by,
         key,
     )
-    .await
+    .await?;
+    // Only a start that wrote a run: a retried key that names a run already
+    // started (200) wrote nothing.
+    if started.0 == StatusCode::CREATED {
+        if let Some(run) = started.1["execution_id"]
+            .as_str()
+            .and_then(|id| parse_execution_id(id).ok())
+        {
+            crate::driver::after_write(driver.as_ref(), draining.as_ref(), &run).await;
+        }
+    }
+    Ok(started)
 }
 
 /// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
@@ -862,6 +893,8 @@ pub(crate) async fn with_derived_state(
 async fn cancel_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -903,6 +936,7 @@ async fn cancel_execution(
         }
     }
 
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
     Ok(Json(json!({ "execution_id": id, "status": "cancelled" })))
 }
 
@@ -1135,11 +1169,14 @@ struct ApproveRequest {
 /// sends its own decision again gets the first one's answer with
 /// `repeat: true`, and nothing is recorded; the rules are in
 /// [`crate::approvals`].
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev_mode: Option<Extension<crate::auth::DevMode>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1217,9 +1254,16 @@ async fn approve_execution(
         }
     }
 
-    Ok(Json(
-        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
-    ))
+    // The answer is read from the run as the decision left it, then the run
+    // is advanced: what an advance does is the next step's news, not this
+    // decision's.
+    let answer =
+        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await;
+    // A repeat appended nothing, so there is nothing to follow.
+    if !submitted.repeat {
+        crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
+    }
+    Ok(Json(answer))
 }
 
 /// The seam between a decision's durable append and its inline seal, on
@@ -1269,13 +1313,17 @@ async fn list_approvals_for_execution(
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
-    // Fast path: serve from the durable projection (eventually-consistent; lags
-    // the write path by up to one projector tick, ~500 ms).
+    // Fast path: serve from the durable projection, but only once it has
+    // caught up with the run: its checkpoint has reached the run's latest
+    // event. The projector lags the log (500 ms with the loops on, a tick
+    // interval with them off), and it never visits a run again once the run
+    // has ended, so a copy that is behind can be behind for good.
     //
-    // Fallback to event-log replay when the projection is empty.  This covers:
-    // - Running executions not yet visited by the projector (no tick yet).
-    // - Terminal executions that completed before a projector tick (projector
-    //   only scans Running; their events were never folded into proj_approvals).
+    // Else the event log is read. This covers:
+    // - A run the projector has not caught up with: a request raised or a
+    //   decision recorded since its last pass, by a write or its advance.
+    // - Terminal executions whose last events came after the projector's last
+    //   pass (the projector only scans Running).
     // - Non-default-tenant executions (the projector runs on the base backend
     //   and writes proj_approvals with tenant_id='default'; reading via
     //   backend_for(&tenant_id) returns nothing for the real tenant).
@@ -1284,7 +1332,19 @@ async fn list_approvals_for_execution(
     // Follow-up: F-2h-tenant (thread tenant into projector writes) + F-2h-terminal
     // (project terminal executions) will close the coverage gap so the fallback
     // shrinks to a thin cold-start edge case.
-    let rows = backend.get_approval_projection(&execution_id).await?;
+    //
+    // The latest sequence is read before the checkpoint, and the rows after
+    // it: the rows are at least as new as the checkpoint they were written
+    // with, so a copy found caught up holds every event the read saw.
+    let latest = backend.latest_sequence(&execution_id).await?;
+    let checkpoint = backend
+        .get_projector_checkpoint("approvals", &execution_id)
+        .await?;
+    let rows = if checkpoint >= latest {
+        backend.get_approval_projection(&execution_id).await?
+    } else {
+        Vec::new()
+    };
 
     if !rows.is_empty() {
         // Projection fast path: build the response from the durable read model.
@@ -1356,9 +1416,9 @@ async fn list_approvals_for_execution(
             serde_json::json!({ "pending": pending, "decided": decided }),
         ))
     } else {
-        // Event-log fallback: guarantees the endpoint is never worse than before
-        // the projection switch (2h-3).  Covers unprojected, terminal, and
-        // non-default-tenant executions until F-2h-tenant + F-2h-terminal land.
+        // Event-log fallback: the run's own log, always current. Covers a
+        // copy that is behind or missing, terminal runs, and non-default
+        // tenants.
         let events = backend.get_events(&execution_id).await?;
         Ok(Json(crate::approvals::approvals_view(&events)))
     }
@@ -1458,6 +1518,8 @@ struct ExternalEventRequest {
 async fn send_external_event(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
     Json(body): Json<ExternalEventRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1475,6 +1537,7 @@ async fn send_external_event(
     );
     backend.append_event(event).await?;
 
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
     Ok(Json(json!({ "execution_id": id, "accepted": true })))
 }
 
@@ -3825,12 +3888,15 @@ fn not_completed(status: StatusCode, reason: impl Into<String>) -> (StatusCode, 
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn complete_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     dev: Option<Extension<crate::auth::DevMode>>,
     token: Option<Extension<jamjet_state::ApiToken>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<CompleteWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -3901,7 +3967,15 @@ async fn complete_work_item(
                 warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
                 return Ok(not_completed(StatusCode::FORBIDDEN, reason));
             }
-            return complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
+            let answer =
+                complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
+            // Only a recorded answer (200) wrote a step; every refusal wrote
+            // nothing the run can move on from.
+            if matches!(&answer, Ok((StatusCode::OK, _))) {
+                crate::driver::after_write(driver.as_ref(), draining.as_ref(), &wi.execution_id)
+                    .await;
+            }
+            return answer;
         }
         if body.model_result.is_some() {
             return Ok(not_completed(
@@ -4214,6 +4288,10 @@ async fn complete_work_item(
     // is right.
     if let Some(wi) = recorded.as_ref() {
         refresh_current_state(backend.as_ref(), &wi.execution_id, &state_patch).await;
+        // The step is recorded: take its run on to the next step before
+        // answering. An item that could not be read recorded no event, so
+        // there is no run to take on.
+        crate::driver::after_write(driver.as_ref(), draining.as_ref(), &wi.execution_id).await;
     }
 
     Ok((
@@ -4961,12 +5039,15 @@ async fn engine_owned(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -
 /// event, so the scheduler fold kept the node in `scheduled` while the row sat in
 /// a `'failed'` status that no sweep ever selects. Every legitimate tool failure
 /// stranded its execution as `Running`, permanently.
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn fail_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev: Option<Extension<crate::auth::DevMode>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<FailWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -5071,6 +5152,10 @@ async fn fail_work_item(
         retryable,
         "fail: worker reported a node failure"
     );
+
+    // The failure is recorded (and a retry queued): the run may fail, or
+    // wait out its backoff, which the next pass sees.
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &item.execution_id).await;
 
     Ok((
         StatusCode::OK,
@@ -5347,6 +5432,128 @@ async fn search_agents(
     Ok(Json(json!({ "agents": agents })))
 }
 
+// ── Request-driven mode ──────────────────────────────────────────────────────
+
+/// The body of `POST /ops/tick`: empty, `{}`, or a budget that can only be
+/// lowered. Nothing in it names a run, a tenant or a node.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TickRequest {
+    budget_ms: Option<u64>,
+}
+
+/// `POST /ops/tick` — one sweep of what the engine's loops do: reclaim lapsed
+/// leases, seal the audit outbox, advance each running run from where the
+/// last tick stopped, run the engine steps left on the queues, project.
+///
+/// Who may call it is decided by the layers in front (a token `require_auth`
+/// admits, with the operator role; no token in dev mode), never by anything
+/// in the request. `200` with the report, or `200` with `ran: false` when
+/// another tick holds the lease; `503` while the server stops; `400` for a
+/// body that is not empty, `{}` or a `budget_ms` of at least 100.
+async fn ops_tick(
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    use crate::driver::{TickResult, MIN_TICK_BUDGET};
+    // A server that is stopping starts no tick: it would have the drain wait
+    // for work the stop is trying to end.
+    let stopping = draining
+        .as_ref()
+        .is_some_and(|Extension(d)| d.0.load(std::sync::atomic::Ordering::SeqCst));
+    if stopping {
+        return Err(ApiError::Unavailable("shutting down".into()));
+    }
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        TickRequest { budget_ms: None }
+    } else {
+        serde_json::from_slice::<TickRequest>(&body)
+            .map_err(|e| ApiError::BadRequest(format!("invalid tick request: {e}")))?
+    };
+    let Some(Extension(driver)) = driver else {
+        return Err(ApiError::Conflict(
+            "this engine cannot tick: it has no driver. Start it with JAMJET_BACKGROUND=off, \
+             or with its embedded workers on, to give it one"
+                .into(),
+        ));
+    };
+    let budget = match request.budget_ms {
+        None => driver.config().tick_budget,
+        Some(ms) if ms < MIN_TICK_BUDGET.as_millis() as u64 => {
+            return Err(ApiError::BadRequest(format!(
+                "budget_ms must be at least {}",
+                MIN_TICK_BUDGET.as_millis()
+            )));
+        }
+        // A larger budget is held to the configured one.
+        Some(ms) => std::time::Duration::from_millis(ms).min(driver.config().tick_budget),
+    };
+    match driver.tick(budget).await? {
+        TickResult::Ran(report) => Ok(Json(json!(*report)).into_response()),
+        TickResult::Busy {
+            held_by,
+            lease_until,
+        } => Ok(Json(json!({
+            "ran": false,
+            "reason": "busy",
+            "held_by": held_by,
+            "lease_until": lease_until.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        }))
+        .into_response()),
+        TickResult::Stopping => Err(ApiError::Unavailable("shutting down".into())),
+    }
+}
+
+/// `GET /ops/status` — the tick row as the store holds it now: who holds the
+/// lease and until when, when the last tick began and when the last finished
+/// one finished, whether it got through, where the next one resumes
+/// (`next_after`), and that tick's report as `POST /ops/tick` answered it.
+/// `tick` is `null` until a tick has begun. Beside it, what `/health` says:
+/// `background`, `tick_overdue`, and the interval the overdue rule counts in.
+///
+/// Any authenticated role may read it. A store that cannot be read answers
+/// as its error does (503 with `Retry-After`, or 500).
+async fn ops_status(
+    State(state): State<AppState>,
+    watch: Option<Extension<std::sync::Arc<crate::driver::TickWatch>>>,
+) -> Result<Json<Value>, ApiError> {
+    let (row, background, tick_overdue, interval) = match &watch {
+        Some(Extension(watch)) => (
+            watch.status().await?,
+            watch.background(),
+            watch.overdue().await,
+            Some(watch.interval().as_secs()),
+        ),
+        None => (
+            state.backend.tick_status().await?,
+            crate::startup::Background::On,
+            None,
+            None,
+        ),
+    };
+    let at = |t: Option<chrono::DateTime<Utc>>| {
+        t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let tick = row.map(|row| {
+        json!({
+            "holder": row.holder,
+            "lease_until": at(row.lease_until),
+            "last_started_at": at(row.last_started_at),
+            "last_finished_at": at(row.last_finished_at),
+            "last_complete": row.last_complete,
+            "next_after": row.cursor,
+            "last_report": row.last_report,
+        })
+    });
+    Ok(Json(json!({
+        "background": background.label(),
+        "tick_interval_secs": interval,
+        "tick_overdue": tick_overdue,
+        "tick": tick,
+    })))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn parse_execution_id(s: &str) -> Result<ExecutionId, ApiError> {
@@ -5594,6 +5801,8 @@ mod tests {
             Extension(tenant.clone()),
             None,
             None,
+            None,
+            None,
             Path(eid.to_string()),
             Json(body()),
         )
@@ -5615,6 +5824,8 @@ mod tests {
             Extension(tenant),
             None,
             Some(Extension(crate::auth::DevMode)),
+            None,
+            None,
             Path(eid.to_string()),
             Json(body()),
         )

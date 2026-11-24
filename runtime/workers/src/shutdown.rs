@@ -71,11 +71,25 @@ impl Shutdown {
         self.running.count.fetch_add(1, Ordering::SeqCst);
         RunningGuard(Arc::clone(&self.running))
     }
+
+    /// Count work done inside a request (an advance of one run, a tick) until
+    /// the guard drops. [`ShutdownTrigger::stop_and_drain`] waits for it as it
+    /// waits for a worker, so a stop signal never cuts a step off that a
+    /// request is running.
+    pub fn track(&self) -> RunningGuard {
+        self.enter()
+    }
+
+    /// Whether shutdown has started. Work done inside a request checks it
+    /// between steps and starts no new one once it is true.
+    pub fn stopping(&self) -> bool {
+        *self.stop.borrow()
+    }
 }
 
-/// Held by a running worker task; dropping it (the task ending, by return or
-/// by panic) counts the worker out.
-pub(crate) struct RunningGuard(Arc<Running>);
+/// Held by a running worker task or by work a request does; dropping it (the
+/// task ending, by return or by panic) counts it out.
+pub struct RunningGuard(Arc<Running>);
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
@@ -105,6 +119,47 @@ impl ShutdownTrigger {
         };
         let _ = tokio::time::timeout(grace, drained).await;
         self.running.count.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tracking {
+    use super::*;
+
+    #[tokio::test]
+    async fn stopping_turns_true_when_the_trigger_fires() {
+        let (trigger, shutdown) = shutdown();
+        assert!(!shutdown.stopping());
+        let seen = shutdown.clone();
+        // The drain sends the stop signal even when nothing is running.
+        assert_eq!(trigger.stop_and_drain(Duration::ZERO).await, 0);
+        assert!(shutdown.stopping());
+        assert!(seen.stopping(), "a clone sees it too");
+    }
+
+    #[tokio::test]
+    async fn the_drain_waits_for_tracked_work() {
+        let (trigger, shutdown) = shutdown();
+        let work = shutdown.track();
+        // Tracked work held past the grace period is reported as still running.
+        let still = trigger.stop_and_drain(Duration::from_millis(50)).await;
+        assert_eq!(still, 1);
+        drop(work);
+    }
+
+    #[tokio::test]
+    async fn the_drain_returns_once_tracked_work_ends() {
+        let (trigger, shutdown) = shutdown();
+        let work = shutdown.track();
+        let drain = tokio::spawn(trigger.stop_and_drain(Duration::from_secs(30)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain.is_finished(), "the drain waits for the work");
+        drop(work);
+        let still = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("the drain ends once the work does")
+            .unwrap();
+        assert_eq!(still, 0);
     }
 }
 

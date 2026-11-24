@@ -156,7 +156,7 @@ async fn the_postgres_hooks_read_and_write_their_rows() {
 
     // Every row, every table.
     let rows = hooks.every_row().await.expect("Postgres keeps rows");
-    assert_eq!(rows.len(), 19, "{:?}", rows.keys());
+    assert_eq!(rows.len(), 20, "{:?}", rows.keys());
     assert_eq!(rows["events"].len(), 2);
     assert!(rows["workflow_executions"][0].contains(&run.to_string()));
     assert!(rows["work_items"][0].contains("as written"));

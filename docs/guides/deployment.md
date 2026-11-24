@@ -71,7 +71,9 @@ Outside dev mode:
 - Set `JAMJET_EMBED_WORKERS=1`. The in-process worker pool is the only thing
   that runs `model`, `condition`, `human_approval`, `eval` and
   `limit_exceeded` nodes; external workers cannot claim them. Without it a run
-  stops at its first such node and stays `running`.
+  stops at its first such node and stays `running`. With the loops off
+  ([Request-driven mode](#request-driven-mode)) the engine runs them inside
+  requests instead, and this setting is ignored.
 - Set `JAMJET_EMBED_CRON=1` if you use cron schedules. There is no separate cron
   process.
 - Approvals need the action digest the reviewer saw, and the person who
@@ -438,7 +440,7 @@ export DATABASE_URL=postgres://jamjet:<password>@db.internal:5432/jamjet
 
 # Before each deploy, once:
 jamjet-server migrate
-# schema at version 2 (2 applied)
+# schema at version 3 (3 applied)
 
 jamjet-server            # every engine instance
 ```
@@ -530,7 +532,10 @@ docker exec jamjet jamjet-server token revoke <token id>
 Mount a volume on `/data`, or every container starts with an empty database
 and the tokens you issued are gone. To run the image on Postgres, pass
 `-e DATABASE_URL=postgres://...` with `-e JAMJET_EMBED_CRON=0`, since cron is
-not supported on Postgres yet. The audit log is hash-chained but not
+not supported on Postgres yet. On a serverless container platform that gives
+an instance no CPU between requests, add `-e JAMJET_BACKGROUND=off` too (see
+[Request-driven mode](#request-driven-mode)).
+The audit log is hash-chained but not
 signed until you give it a key: mount an Ed25519 seed and set
 `JAMJET_AUDIT_SIGNING_MODE=ed25519` and `JAMJET_AUDIT_ED25519_KEY_FILE` (see
 [Signing the audit log](security.md#signing-the-audit-log)).
@@ -569,10 +574,11 @@ instance's files in memory and drops them when the instance stops. A SQLite
 file there is lost with the instance, and a network volume is no safe home for
 SQLite either. So on such a platform `jamjet-server` refuses to start with
 SQLite, and the message names `DATABASE_URL` and the switch below. A
-`postgres://` URL passes the check, but this server build cannot open a
-Postgres store yet (see the top of this guide), so today the choices there are
-the switch below, or `STORAGE_BACKEND=memory`, which starts with a warning and
-keeps nothing.
+`postgres://` URL passes the check: use a managed Postgres there (see
+[Postgres](#postgres-preview)). Where the platform gives an instance no CPU
+between requests, turn the loops off too (see
+[Request-driven mode](#request-driven-mode)). `STORAGE_BACKEND=memory` starts
+with a warning and keeps nothing.
 
 To keep the file anyway, for a trial you will throw away, set
 `JAMJET_ALLOW_EPHEMERAL_STORE=1`. The server then starts with a warning. The
@@ -599,7 +605,7 @@ usually lands on another one.
 
 ```bash
 curl https://engine.example/health
-# {"status":"ok","version":"0.5.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...]}
+# {"status":"ok","version":"0.5.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...],"background":"off","tick_overdue":false}
 ```
 
 `commit` is null when the build had no record of it. `commit_source` says
@@ -666,6 +672,264 @@ for retries and for what the client does after a lost answer.
 
 ---
 
+## Request-driven mode
+
+By default the engine runs its own loops: the scheduler, the approvals
+projector, the in-process workers, the audit outbox drain on Postgres, and
+cron. They need CPU between requests. A serverless container platform may give
+an instance no CPU once it has answered, and stops instances nobody calls, so
+there the loops stall. With `JAMJET_BACKGROUND=off` none of them start. Two
+things move the engine instead:
+
+- **Inline advance.** After a write has committed, and before it answers, the
+  engine takes that run as far as it can. It dispatches the next steps and runs
+  its own quick steps (`condition`, `human_approval`, `limit_exceeded`) within
+  `JAMJET_INLINE_ADVANCE_MS`. The writes that do this are `POST /executions`,
+  approve, cancel, an external event, a work item's complete and fail, and the
+  MCP tools that start, approve and cancel a run.
+- **A tick.** `POST /ops/tick` does once what the loops do. It reclaims lapsed
+  leases, seals the audit outbox on Postgres, advances each running run from
+  where the last tick stopped (applying approval deadlines on the way), runs the
+  engine steps still on its queues, model and eval calls among them, and brings
+  the approvals read model up to date. A scheduler calls it about once a minute.
+
+### Settings
+
+| Variable | What it does | Default |
+|----------|--------------|---------|
+| `JAMJET_BACKGROUND` | `on` or `off`, in any case. Any other value, `0`, `false` and empty included, stops the server | `on` |
+| `JAMJET_TICK_INTERVAL_SECS` | How often you tick, in whole seconds, at least 1. The overdue check below counts in it | `60` |
+| `JAMJET_TICK_BUDGET_MS` | Longest one tick spends, at least 100. A tick request can lower it, never raise it | `45000` |
+| `JAMJET_INLINE_ADVANCE_MS` | Longest a write's advance spends running engine steps, at least 1. One step always runs, whatever the budget | `2000` |
+| `JAMJET_TICK_ENGINE_CONCURRENCY` | Engine steps one tick runs at once, at least 1 | `4` |
+
+The four numbers are read at every start, with the loops on too. A value that
+is set but not valid stops the server, naming the variable.
+
+With the loops off:
+
+- `JAMJET_EMBED_CRON=1` stops the server and names both variables, since cron is
+  a loop. The Docker image sets it, so pass `-e JAMJET_EMBED_CRON=0`. Cron
+  schedules do not fire.
+- `JAMJET_EMBED_WORKERS` is ignored, with one info line. The model setup is
+  still checked at start, so a bad one stops the server as before.
+- On Postgres, `JAMJET_TICK_ENGINE_CONCURRENCY` must be below
+  `JAMJET_PG_POOL_SIZE - 1`, or the server stops: each engine step holds a
+  connection, the tick holds one, and the requests need the rest. The defaults
+  (4 and 10) fit.
+- The server logs `background loops are off; call POST /ops/tick every minute`
+  once at start. In dev mode no loop starts either.
+
+With the loops on, on a platform that sets `K_SERVICE`, the server logs one
+warning at start that the loops need CPU between requests.
+
+### When each step runs
+
+- A step a worker runs moves on at once. Its completion advances the run before
+  it answers, so the next step can be claimed as soon as the worker has its 200.
+- A quick engine step that a write's pass dispatches runs in that write's
+  advance. A run whose first node is a quick step, and a quick step an advance
+  left when its budget ran out, wait for the next tick.
+- A model or eval step the engine runs waits for a tick, which runs it and
+  waits for it to finish. The step after it is dispatched by the next write to
+  the run or the next tick. A run of such steps moves about one step per tick.
+- Approval deadlines expire, and lapsed leases are reclaimed, only on a tick.
+- `GET /approvals` reads the approvals read model. Only a tick brings the
+  model up to date, so it can lag the log by one tick interval.
+  `GET /executions/:id/approvals` reads the model only when it has caught up
+  with the run's log, and reads the log otherwise, so a request that a write
+  raised or decided shows at once. The approve route always decides from the
+  log.
+
+The advance never changes a write's answer. A failure in it is logged and
+counted, and the next tick goes on from the log. It runs as the engine, never as
+the caller, and only after a request that wrote something: a repeated decision,
+or a start whose `run_key` names a run already started, advances nothing. While
+the server stops, writes skip the advance and the next tick catches up. A write
+answers after its advance, so it can take up to `JAMJET_INLINE_ADVANCE_MS` and
+1 s longer. Past that, or once a stop signal arrives, the write answers as it
+would have and the advance goes on, as work the shutdown waits for. On a
+platform that gives an instance no CPU once it has answered, such an advance may
+not finish; a step it left half done is retried once its lease runs out.
+
+### The tick
+
+```bash
+curl -X POST https://engine.example/ops/tick -H "Authorization: Bearer $TICKER_TOKEN"
+```
+
+The body is empty, `{}`, or `{"budget_ms": n}` with `n` at least 100. A larger
+budget is held to `JAMJET_TICK_BUDGET_MS`. Any other field is a 400.
+
+```json
+{"ran": true, "complete": true, "elapsed_ms": 48, "budget_ms": 45000, "over_budget_ms": 0,
+ "reclaimed": {"retried": 0, "dead_lettered": 0},
+ "runs": {"visited": 3, "advanced": 1, "stale_passes": 0, "errors": 0},
+ "engine_steps": {"quick": 1, "slow": 0}, "deadlines": {"expired": 0, "escalated": 0},
+ "audit_outbox": {"sealed": 0, "failed": 0}, "projected": 1,
+ "next_after": null, "background": "off"}
+```
+
+- `complete` is false when the tick stopped before the end: its budget ran out,
+  the server began to stop, or a read failed. `next_after` is the run it stopped
+  after, and the next tick starts there. Tick again, or use
+  `jamjet ops tick --until-complete`.
+- `over_budget_ms` is how far past its budget the tick ran, waiting for engine
+  steps it had started. A tick starts engine steps only in the first half of its
+  budget, and a step in hand always finishes.
+- While another tick runs, on this instance or on another engine on the same
+  store, the answer is `{"ran": false, "reason": "busy", "held_by": "...",
+  "lease_until": "..."}` with 200. `lease_until` is null when the other tick
+  runs on the same instance.
+- `503` with `Retry-After: 1` while the server stops.
+- `409` from an engine with the loops on and no embedded workers: it has
+  nothing to run engine steps with. With the embedded workers on, or in dev
+  mode, a tick runs beside the loops and says `"background": "on"`.
+
+Two ticks never run at once. A lock in each process and a lease in the store
+collapse them to one, so with several engines on one database you can tick any
+of them. A repeated or late tick records nothing twice. That rests on the
+store's conditional writes, not on the lease. The lease lasts 30 s, and a
+running tick renews it every 10 s for as long as it runs, however long the steps
+it waits for take. If an instance dies mid-tick, ticks answer busy until its
+lease lapses, within 30 s. A tick goes on when its caller hangs up, so a
+scheduler that gives up early does not cut it off between two steps.
+
+### Who may call the tick
+
+1. Outside dev mode, a Bearer token the engine admits (it exists, is not revoked
+   or expired, and is in tenant `default`) with the `operator` role. No token,
+   or a bad one, is a 401. Any other role, or another tenant's operator token,
+   is a 403. POST only.
+2. In dev mode, no token, as for every route. Dev mode listens on loopback only
+   unless `JAMJET_DEV_MODE_ALLOW_REMOTE=1`.
+3. A platform identity check in front of the engine is a second gate, never a
+   replacement. The engine reads no platform header for identity.
+4. The body can only lower the budget. It names no run, tenant or node.
+5. A tick does only what the loops would do. It cannot approve, pick a branch
+   or complete a worker's step. The inline advance is the same, and runs as the
+   engine.
+6. Ticks collapse to one at a time, so a flood of ticks from a stolen operator
+   token costs one running tick. The token is the larger risk.
+
+The tick takes the JamJet token in `Authorization` only, as every route does.
+It is never open to the platform's identity alone: one wrong invoker permission
+would then open the engine.
+
+`GET /ops/status` changes nothing, and any role may read it. See
+[Noticing that nobody ticks](#noticing-that-nobody-ticks).
+
+### The scheduler's token
+
+Give the scheduler an operator token of its own, used for nothing else. Keep it
+in your platform's secret store, not in the job's settings. Rotate it in three
+steps: issue, deploy, revoke.
+
+```bash
+# 1. Issue a new token, with the server's DATABASE_URL and audit signing settings.
+jamjet-server token create --role operator --name ticker
+# 2. Put it in the secret store, and deploy the scheduler or job that reads it.
+# 3. Once a tick with the new token has run, revoke the old one by its id.
+jamjet-server token revoke <old token id>
+```
+
+`token create` prints the token once, on stdout, and its id on stderr. Run the
+token commands where they can reach the database, for example as a one-off job
+from the same image.
+
+### A scheduler that can send one credential
+
+Without a platform identity check in front, any scheduler that can send a POST
+with a header can tick: `Authorization: Bearer <operator token>`.
+
+Behind one, a tick needs two credentials in two headers (see
+[Behind a platform identity check](#behind-a-platform-identity-check)). A
+scheduler that can send only its platform identity token, in `Authorization`,
+cannot send the engine's token too. Run `jamjet ops tick` as a scheduled job
+instead. It sends both:
+
+```bash
+JAMJET_TOKEN=<operator token> jamjet ops tick \
+  --runtime https://engine.example \
+  --google-id-token-audience https://engine.example
+```
+
+It exits 0 when a tick ran or another was running, 1 on an error, and 2 when
+the engine has no tick route. `--until-complete` ticks again until a tick
+reports `complete`, at most `--max-calls` times (10 by default). `--json` prints
+the last answer. From Python, `await client.tick()` sends one tick.
+
+### Timeouts
+
+The platform's request timeout must cover the tick budget plus the slowest
+engine step, because a tick waits for every step it started. One model call can
+take up to `JAMJET_MODEL_TIMEOUT_SECS` (300 s by default), or less where a
+model's own `timeout_secs` in the IR says so. With the defaults, allow at least
+45 s plus 300 s. Lower the model timeout or the tick budget if your platform's
+limit is shorter.
+
+A tick that waits for a slow step keeps renewing its lease, so no other tick
+starts beside it, and ticks on any engine of the store answer busy until it
+ends.
+
+On a stop signal, a tick or an advance in progress counts as work the shutdown
+waits for, within the grace (4 s on a platform). A tick that is stopping
+finishes the run in hand, starts nothing more and gives its lease back. A step
+still running when the platform kills the instance is retried once its lease
+runs out, as at any kill.
+
+### Noticing that nobody ticks
+
+With the loops off nothing fails when the ticks stop, so `/health` says so:
+
+```bash
+curl https://engine.example/health
+# {"status":"ok",...,"background":"off","tick_overdue":false}
+```
+
+- `tick_overdue` is true when the last tick finished more than three intervals
+  ago (`JAMJET_TICK_INTERVAL_SECS`), or when none has finished and the process
+  has been up for longer than that. A tick that holds a live lease is running,
+  so a long tick is not overdue. It is null with the loops on, and when the
+  store could not be read, or not within 2 s. `status` stays `"ok"`, since the
+  process still serves.
+- Each instance reads the tick state at most every 30 s, so a tick another
+  engine finished shows up to 30 s later.
+- While a tick is overdue, any request makes the instance log one error line,
+  at most once every 5 minutes: `no tick for N s while the background loops are
+  off: approvals do not expire, lapsed leases are not reclaimed, engine steps do
+  not run`. Alert on it.
+
+`GET /ops/status` reads the stored tick state fresh, and returns it with the
+last tick's report as `POST /ops/tick` answered it:
+
+```bash
+curl https://engine.example/ops/status -H "Authorization: Bearer $JAMJET_TOKEN"
+# {"background":"off","tick_interval_secs":60,"tick_overdue":false,
+#  "tick":{"holder":null,"lease_until":null,
+#          "last_started_at":"2026-11-23T10:00:00.006Z","last_finished_at":"2026-11-23T10:00:00.054Z",
+#          "last_complete":true,"next_after":null,"last_report":{"ran":true,"complete":true,...}}}
+```
+
+`tick` is null until a tick has begun. When the store cannot be reached, or does
+not answer within 2 s, the route answers 503 with `Retry-After`. Any other store
+error is a 500.
+
+### A deploy, in order
+
+1. `jamjet-server migrate` against the managed Postgres, before the new
+   instances start ([Migrate before each deploy](#migrate-before-each-deploy)).
+2. Start the engine with the Postgres `DATABASE_URL`, `JAMJET_BACKGROUND=off`
+   and `JAMJET_EMBED_CRON=0`.
+3. Issue the scheduler's operator token and put it in the secret store.
+4. Schedule a tick every `JAMJET_TICK_INTERVAL_SECS`, a minute by default.
+5. Set the platform's request timeout above the tick budget plus the slowest
+   engine step.
+6. A few minutes after the deploy, check that `/health` says
+   `"tick_overdue": false`.
+
+---
+
 ## Environment variables
 
 These are the variables that change what the server does.
@@ -690,6 +954,7 @@ any other value.
 | `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses the store `DATABASE_URL` names | the store `DATABASE_URL` names |
 | `JAMJET_EMBED_WORKERS` | Runs the in-process worker pool outside dev mode | off (`1` in the Docker image) |
 | `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`; refused on Postgres) | off (`1` in the Docker image) |
+| `JAMJET_BACKGROUND` | `on` or `off` (not one of the switches above): `off` starts none of the engine's loops, and a caller ticks it. See [Request-driven mode](#request-driven-mode), which lists `JAMJET_TICK_INTERVAL_SECS`, `JAMJET_TICK_BUDGET_MS`, `JAMJET_INLINE_ADVANCE_MS` and `JAMJET_TICK_ENGINE_CONCURRENCY` too | `on` |
 | `JAMJET_STORE_TERM` | Failover generation for the lease fence, a non-negative integer. An invalid value fails startup | unset |
 | `JAMJET_PUBLIC_URL` | Base URL used for the `did:web` id in `/.well-known/did.json` | `http://$JAMJET_BIND:$JAMJET_PORT` |
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |
@@ -714,12 +979,15 @@ any other value.
 
 ```bash
 curl http://localhost:7700/health
-# {"status":"ok","version":"0.5.0","commit":null,"commit_source":"none","features":[...]}
+# {"status":"ok","version":"0.5.0","commit":null,"commit_source":"none","features":[...],"background":"on","tick_overdue":null}
 ```
 
 `commit` and `features` are described under
-[On a serverless container platform](#on-a-serverless-container-platform).
+[On a serverless container platform](#on-a-serverless-container-platform),
+`background` and `tick_overdue` under
+[Request-driven mode](#noticing-that-nobody-ticks).
 
-`/health` is the only status route. A path the API does not serve answers
+`/health` is the only status route that needs no token. `GET /ops/status`
+needs one, of any role. A path the API does not serve answers
 `200` with the web UI's HTML for `GET`, so check the status code and the
 content type when you probe a route.

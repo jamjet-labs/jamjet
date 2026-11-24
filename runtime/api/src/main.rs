@@ -1,6 +1,6 @@
 use jamjet_agents::{InMemoryAgentRegistry, SqliteAgentRegistry};
 use jamjet_api::cli::Command;
-use jamjet_api::startup::{self, DevBind, StoreKind};
+use jamjet_api::startup::{self, Background, DevBind, StoreKind};
 use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
@@ -131,12 +131,23 @@ async fn main() -> anyhow::Result<()> {
         &startup::existing_database_url(&config),
     );
 
+    // The loops switch and its rules, before the database is opened.
+    let background_plan = startup::background_plan_from_env(store_kind)?;
+    let background = background_plan.background;
+
     info!(
         port = config.port,
         dev_mode = config.dev_mode,
         storage = %store_kind.label(),
+        background = background.label(),
         "Starting JamJet runtime"
     );
+    for notice in &background_plan.notices {
+        match notice {
+            startup::Notice::Info(line) => info!("{line}"),
+            startup::Notice::Warn(line) => warn!("{line}"),
+        }
+    }
     // Cron on Postgres would start each schedule once per engine: refuse
     // the opt-in, skip dev mode's cron, before opening the database.
     if store_kind == StoreKind::Postgres {
@@ -296,6 +307,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // With `JAMJET_BACKGROUND=off` none of the loops below start: no
+    // scheduler, projector, outbox drain, embedded workers or cron. A caller
+    // drives the engine instead.
+    //
     // Spawn the scheduler as a background task — auto-chains nodes after completion.
     // The scheduler and the embedded workers seal the approval records they
     // append (requests, expiries, escalations) into the same audit chain as
@@ -305,23 +320,30 @@ async fn main() -> anyhow::Result<()> {
     // workers finish the items they hold, for up to the grace period.
     let shutdown_grace = shutdown_plan.grace;
     let (shutdown_trigger, shutdown) = jamjet_worker::shutdown();
-    let scheduler =
-        jamjet_scheduler::Scheduler::new(state.backend.clone()).with_sealer(state.enricher.clone());
-    let scheduler_stop = shutdown.receiver();
-    let scheduler_handle = tokio::spawn(async move { scheduler.run_until(scheduler_stop).await });
-    info!("Scheduler started");
+    let scheduler_handle = if background == Background::On {
+        let scheduler = jamjet_scheduler::Scheduler::new(state.backend.clone())
+            .with_sealer(state.enricher.clone());
+        let scheduler_stop = shutdown.receiver();
+        let handle = tokio::spawn(async move { scheduler.run_until(scheduler_stop).await });
+        info!("Scheduler started");
+        Some(handle)
+    } else {
+        None
+    };
 
     // Spawn the async projector alongside the scheduler.  Maintains the durable
     // proj_approvals read-model so the approvals endpoint serves from a projection
     // instead of replaying the event log on every request.
     // It holds no work of its own, so it stops with the process.
-    let projector = jamjet_scheduler::Projector::new(state.backend.clone());
-    tokio::spawn(async move { projector.run().await });
-    info!("Projector started");
+    if background == Background::On {
+        let projector = jamjet_scheduler::Projector::new(state.backend.clone());
+        tokio::spawn(async move { projector.run().await });
+        info!("Projector started");
+    }
 
     // On Postgres, the outbox drain seals the sealed events whose inline
     // seal was lost: now, and every 2 s.
-    if let Some(pg) = postgres {
+    if let Some(pg) = postgres.clone().filter(|_| background == Background::On) {
         jamjet_api::store::spawn_outbox_drain(pg, state.enricher.clone());
         info!("Audit outbox drain started");
     }
@@ -330,14 +352,50 @@ async fn main() -> anyhow::Result<()> {
     // pool so submitted workflows actually execute. In production, run dedicated
     // worker processes against the same state backend instead. The base backend
     // claims across all tenants, so workers drain every execution's queue.
-    if config.dev_mode || embed_workers {
+    //
+    // With the loops off the engine runs its own steps inside requests, so
+    // the model registry is still built and checked: a bad model setup
+    // stops startup either way.
+    let engine_runs_steps = background == Background::Off || config.dev_mode || embed_workers;
+    let model_registry = if engine_runs_steps {
         // Checked on its own so a bad value is reported as what it is.
         jamjet_models::http::model_timeout().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let model_registry = Arc::new(
+        Some(Arc::new(
             jamjet_models::registry::registry_from_env_checked()
                 .await
                 .map_err(|e| anyhow::anyhow!("model seam coverage guard failed: {e}"))?,
-        );
+        ))
+    } else {
+        None
+    };
+    // Says when nobody ticks an engine whose loops are off: `/health` reports
+    // it and any request logs it, at most every 5 minutes. It exists in every
+    // mode, so `/health` says `background` whatever the mode; with the loops
+    // on it reads nothing.
+    let tick_watch = Arc::new(jamjet_api::driver::TickWatch::new(
+        state.backend.clone(),
+        background,
+        background_plan.driver.tick_interval,
+    ));
+    // The driver answers `POST /ops/tick`: it runs the engine's own steps, so
+    // it exists wherever this process can (the loops off, dev mode or the
+    // embedded workers). An engine with the loops on and no workers of its
+    // own leaves those steps to whoever runs them, and has no tick to offer.
+    let driver = model_registry.clone().map(|models| {
+        let driver = jamjet_api::driver::Driver::new(
+            &state,
+            models,
+            shutdown.clone(),
+            background_plan.driver,
+        )
+        .with_background(background)
+        .with_watch(tick_watch.clone());
+        Arc::new(match postgres {
+            Some(pg) => driver.with_outbox(pg),
+            None => driver,
+        })
+    });
+    if let Some(model_registry) = model_registry.filter(|_| background == Background::On) {
         // Exactly the kinds `POST /workflows` accepts as in-process
         // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
         let pool = jamjet_worker::server_pool(state.backend.clone(), model_registry)
@@ -362,7 +420,10 @@ async fn main() -> anyhow::Result<()> {
     // supported way to run cron, in production too: there is no separate cron
     // process, because one would need its own token and would become the
     // initiator of every run it starts.
-    if (config.dev_mode || embed_cron) && store_kind == StoreKind::Sqlite {
+    if background == Background::On
+        && (config.dev_mode || embed_cron)
+        && store_kind == StoreKind::Sqlite
+    {
         let database_url = startup::database_url(&config);
         match jamjet_state::SqliteBackend::open(&database_url).await {
             Ok(b) => {
@@ -377,7 +438,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The driver travels as a request extension: `POST /ops/tick` and the
+    // inline advance after a write read it there. The advance reads the
+    // driver's `Background` and does nothing with the loops on, so in dev mode
+    // or with the embedded workers the layer only serves the tick.
     let router = build_router_with_opts(state, config.dev_mode);
+    let router = match driver {
+        Some(driver) => router.layer(axum::Extension(driver)),
+        None => router,
+    };
+    let router = jamjet_api::driver::watch_ticks(router, tick_watch);
     // Dev mode answers only requests addressed to this machine (or a name in
     // JAMJET_DEV_ALLOWED_HOSTS), not relayed and not cross-site, on any bind:
     // see `startup::dev_refusal`.
@@ -446,7 +516,10 @@ async fn main() -> anyhow::Result<()> {
             "Grace period over with workers still running; their items are reclaimed when the lease expires"
         );
     }
-    let _ = tokio::time::timeout(jamjet_worker::shutdown::SCHEDULER_STOP, scheduler_handle).await;
+    if let Some(scheduler_handle) = scheduler_handle {
+        let _ =
+            tokio::time::timeout(jamjet_worker::shutdown::SCHEDULER_STOP, scheduler_handle).await;
+    }
     match ended {
         Some(res) => res??,
         None => {

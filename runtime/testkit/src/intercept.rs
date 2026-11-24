@@ -17,7 +17,8 @@ use jamjet_state::backend::{
     ConditionalAppend, EventCondition, ExecutionClaim, ExecutionFinish, FailOutcome, GateMark,
     KeyedStart, LeaseRenewal, LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow,
     ReclaimResult, ReserveOutcome, RunKeyClaim, RunKeyRecord, RunningPage, SchedulerPass,
-    StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
+    StateBackend, StateBackendError, TickBegin, TickOutcome, TickStatus, TurnCommit, WorkItem,
+    WorkItemId, WorkflowDefinition,
 };
 use jamjet_state::event::{Event, EventKind, EventSequence};
 use jamjet_state::snapshot::Snapshot;
@@ -294,6 +295,21 @@ pub enum Op<'a> {
         error: &'a str,
     },
     StoreNow,
+
+    // ── Request-driven mode ──────────────────────────────────────────────
+    BeginTick {
+        holder: &'a str,
+        lease: std::time::Duration,
+    },
+    FinishTick {
+        holder: &'a str,
+        outcome: &'a TickOutcome,
+    },
+    TickStatus,
+    RenewTick {
+        holder: &'a str,
+        lease: std::time::Duration,
+    },
 }
 
 /// What a test does around each call [`Intercept`] delegates.
@@ -1352,6 +1368,40 @@ impl StateBackend for Intercept {
                 None => self.inner.store_now().await,
             }
         })
+    }
+
+    // ── Request-driven mode ──────────────────────────────────────────────
+
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<TickBegin> {
+        around!(
+            self,
+            Op::BeginTick { holder, lease },
+            self.inner.begin_tick(holder, lease)
+        )
+    }
+
+    async fn finish_tick(&self, holder: &str, outcome: &TickOutcome) -> BackendResult<bool> {
+        around!(
+            self,
+            Op::FinishTick { holder, outcome },
+            self.inner.finish_tick(holder, outcome)
+        )
+    }
+
+    async fn tick_status(&self) -> BackendResult<Option<TickStatus>> {
+        around!(self, Op::TickStatus, self.inner.tick_status())
+    }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        around!(
+            self,
+            Op::RenewTick { holder, lease },
+            self.inner.renew_tick(holder, lease)
+        )
     }
 }
 

@@ -68,6 +68,8 @@ pub struct InMemoryBackend {
     /// another one's work calls its `*_locked` helper, because the lock is
     /// not re-entrant.
     pass_lock: tokio::sync::Mutex<()>,
+    /// The tick row, `None` until the first tick begins.
+    tick: std::sync::Mutex<Option<crate::backend::TickStatus>>,
 }
 
 impl InMemoryBackend {
@@ -94,6 +96,7 @@ impl InMemoryBackend {
             last_lease: DashMap::new(),
             run_keys: DashMap::new(),
             pass_lock: tokio::sync::Mutex::new(()),
+            tick: std::sync::Mutex::new(None),
         }
     }
 
@@ -1928,6 +1931,73 @@ impl StateBackend for InMemoryBackend {
             self.push_event(Event::new(execution_id.clone(), 0, kind));
         }
         Ok(Some(outcome))
+    }
+
+    // ── Request-driven mode ──────────────────────────────────────────────
+
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<crate::backend::TickBegin> {
+        use crate::backend::TickBegin;
+        let lease = crate::backend::tick_lease(lease)?;
+        let now = crate::clock::process_now();
+        let mut tick = self.tick.lock().unwrap_or_else(|e| e.into_inner());
+        let row = tick.get_or_insert_with(Default::default);
+        if let (Some(holder), Some(lease_until)) = (&row.holder, row.lease_until) {
+            if lease_until > now {
+                return Ok(TickBegin::Busy {
+                    holder: holder.clone(),
+                    lease_until,
+                });
+            }
+        }
+        row.holder = Some(holder.to_string());
+        row.lease_until = Some(now + lease);
+        row.last_started_at = Some(now);
+        Ok(TickBegin::Began {
+            cursor: row.cursor.clone(),
+            last_finished_at: row.last_finished_at,
+        })
+    }
+
+    async fn finish_tick(
+        &self,
+        holder: &str,
+        outcome: &crate::backend::TickOutcome,
+    ) -> BackendResult<bool> {
+        let mut tick = self.tick.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = tick.as_mut() else {
+            return Ok(false);
+        };
+        if row.holder.as_deref() != Some(holder) {
+            return Ok(false);
+        }
+        row.holder = None;
+        row.lease_until = None;
+        row.last_finished_at = Some(crate::clock::process_now());
+        row.last_complete = Some(outcome.complete);
+        row.last_report = Some(outcome.report.clone());
+        row.cursor = outcome.cursor.clone();
+        Ok(true)
+    }
+
+    async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
+        Ok(self.tick.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        let lease = crate::backend::tick_lease(lease)?;
+        let mut tick = self.tick.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = tick.as_mut() else {
+            return Ok(false);
+        };
+        if row.holder.as_deref() != Some(holder) {
+            return Ok(false);
+        }
+        row.lease_until = Some(crate::clock::process_now() + lease);
+        Ok(true)
     }
 }
 

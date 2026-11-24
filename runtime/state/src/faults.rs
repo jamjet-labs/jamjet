@@ -28,6 +28,11 @@
 //! with [`arm`], or with [`arm_from_env`] in a server the test starts. A
 //! test that shares its binary with other tests arms them in a [`Scope`],
 //! and the faults reach only the calls it runs inside [`Scope::run`].
+//!
+//! A server armed from its environment says on stderr when it reaches the
+//! point, so the test that started it can tell the fault fired: an abort
+//! prints `fault point <label>#<step>: abort`, a hang `fault point
+//! <label>#<step>: hang <ms> ms` as it begins.
 
 use crate::backend::BackendResult;
 #[cfg(feature = "test-hooks")]
@@ -123,6 +128,10 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.fail_work_item_fenced_recorded", 7),
     ("sqlite.patch_append_array", 1),
     ("sqlite.patch_append_array", 2),
+    ("sqlite.begin_tick", 1),
+    ("sqlite.begin_tick", 2),
+    ("sqlite.finish_tick", 1),
+    ("sqlite.renew_tick", 1),
     // tenant_scoped.rs: the scoped copies of the unscoped bodies.
     ("sqlite_scoped.commit_turn", 1),
     ("sqlite_scoped.commit_turn", 2),
@@ -213,6 +222,10 @@ pub const POINTS: &[(&str, u32)] = &[
     ("pg.commit_turn", 10),
     ("pg.apply_approval_projection", 1),
     ("pg.apply_approval_projection", 2),
+    // postgres/ticks.rs: one body serves the unscoped and the scoped store.
+    ("pg.begin_tick", 1),
+    ("pg.finish_tick", 1),
+    ("pg.renew_tick", 1),
     // postgres/tx.rs: seams, the start of each attempt of a transaction,
     // before its `BEGIN`, and the start of each retry.
     ("pg_tx.attempt", 1),
@@ -223,6 +236,16 @@ pub const POINTS: &[(&str, u32)] = &[
     // scheduler/src/runner.rs: a seam, after a pass that dispatched work has
     // committed and before the scheduler updates what it keeps for the run.
     ("dispatch.after_commit", 1),
+    // api/src/driver.rs: seams in a tick, after it has taken its lease and
+    // after each run its walk advanced.
+    ("tick.after_begin", 1),
+    ("tick.mid_walk", 1),
+    // api/src/driver.rs: a seam in the inline advance, after a write has
+    // committed and before the advance that follows it. workers/src/worker.rs:
+    // a seam in an engine step an advance runs, after its item is claimed and
+    // before the step runs.
+    ("inline.after_write", 1),
+    ("inline.mid_engine_step", 1),
     // audit/src/postgres.rs: the line before every commit of an append to
     // the Postgres audit log, a seal onto the head included.
     ("audit.seal.before_commit", 1),
@@ -257,6 +280,12 @@ pub async fn hit(label: &'static str, step: u32) -> BackendResult<()> {
             "fault injected at {label}#{step}"
         ))),
         Some(Fault::Hang(how_long)) => {
+            if registry::hangs_from_env(label, step) {
+                eprintln!(
+                    "fault point {label}#{step}: hang {} ms",
+                    how_long.as_millis()
+                );
+            }
             tokio::time::sleep(how_long).await;
             Ok(())
         }
@@ -296,17 +325,42 @@ pub fn disarm_all() {
 }
 
 /// Arm [`Fault::Abort`] at the point `JAMJET_TEST_CRASH_AT` names, as
-/// `label#step`, or as a bare `label` for its step 1. Does nothing when the
-/// variable is unset, and nothing at all without the feature: the variable's
-/// name is not in such a build. Panics on a name that is not in [`POINTS`],
-/// so a mistyped point cannot pass for one that was never reached.
+/// `label#step`, or as a bare `label` for its step 1, and [`Fault::Hang`] at
+/// the point `JAMJET_TEST_HANG_AT` names, as `label#step=<milliseconds>`.
+/// Does nothing when the variables are unset, and nothing at all without the
+/// feature: their names are not in such a build. Panics on a name that is not
+/// in [`POINTS`], so a mistyped point cannot pass for one that was never
+/// reached, and on a hang with no length.
 pub fn arm_from_env() {
     #[cfg(feature = "test-hooks")]
-    if let Ok(spec) = std::env::var("JAMJET_TEST_CRASH_AT") {
-        let (label, step) =
-            point_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_CRASH_AT: {e}"));
-        arm(label, step, Fault::Abort);
+    {
+        if let Ok(spec) = std::env::var("JAMJET_TEST_CRASH_AT") {
+            let (label, step) =
+                point_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_CRASH_AT: {e}"));
+            arm(label, step, Fault::Abort);
+        }
+        if let Ok(spec) = std::env::var("JAMJET_TEST_HANG_AT") {
+            let (label, step, how_long) =
+                hang_named(&spec).unwrap_or_else(|e| panic!("JAMJET_TEST_HANG_AT: {e}"));
+            registry::announce_hang(label, step);
+            arm(label, step, Fault::Hang(how_long));
+        }
     }
+}
+
+/// The declared point and the hang `spec` names: `label#step=<ms>`, or
+/// `label=<ms>` for step 1.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+fn hang_named(spec: &str) -> Result<(&'static str, u32, Duration), String> {
+    let Some((point, ms)) = spec.rsplit_once('=') else {
+        return Err(format!("{spec:?}: no =<milliseconds> after the point"));
+    };
+    let ms = ms
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{spec:?}: the hang is not a whole number of milliseconds"))?;
+    let (label, step) = point_named(point)?;
+    Ok((label, step, Duration::from_millis(ms)))
 }
 
 /// The declared point `spec` names: `label#step`, or `label` for step 1.
@@ -438,6 +492,19 @@ mod registry {
     /// The faults armed for the process.
     pub(super) static GLOBAL: Mutex<Registry> = Mutex::new(Registry::new());
 
+    /// The hang the environment armed, which says on stderr when it begins.
+    /// Hangs a test arms itself stay quiet: they would print from the
+    /// runtime's threads, past the test harness's capture.
+    static ENV_HANG: std::sync::OnceLock<(&'static str, u32)> = std::sync::OnceLock::new();
+
+    pub(super) fn announce_hang(label: &'static str, step: u32) {
+        let _ = ENV_HANG.set((label, step));
+    }
+
+    pub(super) fn hangs_from_env(label: &'static str, step: u32) -> bool {
+        ENV_HANG.get() == Some(&(label, step))
+    }
+
     tokio::task_local! {
         /// The faults of the [`Scope`](super::Scope) the task runs in.
         pub(super) static SCOPED: Arc<Mutex<Registry>>;
@@ -475,5 +542,23 @@ mod tests {
         assert!(point_named(&format!("{label}#{}", step + 1000)).is_err());
         assert!(point_named(&format!("{label}#x")).is_err());
         assert!(point_named("no.such_point").is_err());
+    }
+
+    #[test]
+    fn a_hang_is_named_with_its_length() {
+        assert_eq!(
+            hang_named("sqlite.commit_turn#11=2500"),
+            Ok(("sqlite.commit_turn", 11, Duration::from_millis(2500)))
+        );
+        assert_eq!(
+            hang_named("tick.mid_walk=30"),
+            Ok(("tick.mid_walk", 1, Duration::from_millis(30)))
+        );
+        assert!(hang_named("sqlite.commit_turn#11").is_err(), "no length");
+        assert!(hang_named("sqlite.commit_turn#11=2.5s").is_err());
+        assert!(
+            hang_named("sqlite.commit_turn#99=10").is_err(),
+            "no such step"
+        );
     }
 }

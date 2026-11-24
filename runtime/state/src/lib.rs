@@ -45,6 +45,7 @@ pub use backend::{ApprovalCursor, OpenWorkItem, PendingApprovalRow};
 pub use backend::{ClaimFilter, ExecutionClaim, GateMark, LeasedItem};
 pub use backend::{KeyedStart, RunKeyClaim, RunKeyRecord};
 pub use backend::{PassCommit, SchedulerPass};
+pub use backend::{TickBegin, TickOutcome, TickStatus, MAX_TICK_LEASE};
 pub use budget::{BudgetState, BudgetTrip};
 pub use caps::{CapKind, CapTrip, RunCaps};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};

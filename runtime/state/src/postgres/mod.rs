@@ -20,6 +20,7 @@ mod run_keys;
 mod runs;
 mod schema;
 mod settings;
+mod ticks;
 mod tokens;
 mod tx;
 
@@ -40,7 +41,7 @@ use crate::backend::{
     ConditionalAppend, ExecutionFinish, FailOutcome, GateMark, KeyedStart, LeaseRenewal,
     LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow, ReclaimResult, ReserveOutcome,
     RunKeyClaim, RunKeyRecord, RunningPage, SchedulerPass, StateBackend, StateBackendError,
-    TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
+    TickBegin, TickOutcome, TickStatus, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -784,5 +785,29 @@ impl StateBackend for PgBackend {
             .fetch_one(&self.pool)
             .await
             .map_err(tx::statement_error)
+    }
+
+    // ── Request-driven mode ──────────────────────────────────────────────
+
+    /// The tick row is the database's, not a tenant's: a tenant's view
+    /// takes and reads the lease the unscoped store does.
+    async fn begin_tick(
+        &self,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> BackendResult<TickBegin> {
+        ticks::begin_tick(self, holder, lease).await
+    }
+
+    async fn finish_tick(&self, holder: &str, outcome: &TickOutcome) -> BackendResult<bool> {
+        ticks::finish_tick(self, holder, outcome).await
+    }
+
+    async fn tick_status(&self) -> BackendResult<Option<TickStatus>> {
+        ticks::tick_status(self).await
+    }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        ticks::renew_tick(self, holder, lease).await
     }
 }

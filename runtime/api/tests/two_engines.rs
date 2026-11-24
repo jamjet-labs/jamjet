@@ -326,6 +326,10 @@ async fn two_engines_on_one_sqlite_file_complete_every_node_once() {
 /// one of the ten staggered ones, so the bunched group alone cannot pass it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_engines_cancel_and_finish_race_once() {
+    // The first HTTP client a test process builds sets up its TLS, which
+    // takes many seconds on a loaded machine. It is built before any case's
+    // clock starts, so that cost falls outside the budget.
+    let http = client();
     for backend in [Backend::Sqlite, Backend::Postgres] {
         let case = format!("two_engines_cancel_and_finish_race_once ({backend:?})");
         let Some(store) = TestStore::on(backend, &case).await else {
@@ -336,7 +340,6 @@ async fn two_engines_cancel_and_finish_race_once() {
             let no_workers = [("JAMJET_EMBED_WORKERS", "0")];
             let a = Engine::start(&store, &no_workers).await;
             let b = Engine::start(&store, &no_workers).await;
-            let http = client();
             let workflow = format!("race-{}", uuid::Uuid::new_v4().simple());
             register(&http, &a.base(), &store.developer, &work_only(&workflow)).await;
             // (wait before the completion, wait from it to the cancel), in ms.
@@ -458,10 +461,12 @@ async fn skewed_engine_does_not_reclaim_a_live_lease() {
     let Some(store) = TestStore::postgres(case).await else {
         return;
     };
+    // The first HTTP client a test process builds sets up its TLS, which
+    // takes many seconds on a loaded machine: built before the clock starts.
+    let http = client();
     within(case, Duration::from_secs(15), async {
         let a = Engine::start(&store, &[("JAMJET_EMBED_WORKERS", "0")]).await;
         let b = Engine::start(&store, &[("JAMJET_TEST_CLOCK_SKEW_SECS", "120")]).await;
-        let http = client();
         let workflow = format!("skew-lease-{}", uuid::Uuid::new_v4().simple());
         register(&http, &a.base(), &store.developer, &work_only(&workflow)).await;
         let run = start_run(&http, &a.base(), &store.developer, &workflow).await;
@@ -495,11 +500,13 @@ async fn skewed_engine_does_not_expire_an_approval_early() {
     let Some(store) = TestStore::postgres(case).await else {
         return;
     };
+    // The first HTTP client a test process builds sets up its TLS, which
+    // takes many seconds on a loaded machine: built before the clock starts.
+    let http = client();
     within(case, Duration::from_secs(10), async {
         let skewed = [("JAMJET_TEST_CLOCK_SKEW_SECS", "120")];
         let a = Engine::start(&store, &[("JAMJET_EMBED_WORKERS", "0")]).await;
         let b = Engine::start(&store, &skewed).await;
-        let http = client();
         let workflow = format!("skew-deadline-{}", uuid::Uuid::new_v4().simple());
         register(
             &http,
