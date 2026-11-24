@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.0 - 2026-11-24
+
 ### Added
 
 - **`JamjetClient(auth=...)`, an auth hook for an engine behind a platform identity

@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-protocols = { path = "..", version = "=0.5.0" }
+jamjet-protocols = { path = "..", version = "=0.6.0" }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { workspace = true }

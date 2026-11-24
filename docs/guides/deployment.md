@@ -605,7 +605,7 @@ usually lands on another one.
 
 ```bash
 curl https://engine.example/health
-# {"status":"ok","version":"0.5.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...],"background":"off","tick_overdue":false}
+# {"status":"ok","version":"0.6.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...],"background":"off","tick_overdue":false}
 ```
 
 `commit` is null when the build had no record of it. `commit_source` says
@@ -979,7 +979,7 @@ any other value.
 
 ```bash
 curl http://localhost:7700/health
-# {"status":"ok","version":"0.5.0","commit":null,"commit_source":"none","features":[...],"background":"on","tick_overdue":null}
+# {"status":"ok","version":"0.6.0","commit":null,"commit_source":"none","features":[...],"background":"on","tick_overdue":null}
 ```
 
 `commit` and `features` are described under
