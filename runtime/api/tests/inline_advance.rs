@@ -2126,7 +2126,16 @@ async fn answers_are_the_same_with_loops_on_and_off() {
             answers.push((name, bodies));
         }
 
-        assert!(answers.len() >= 2, "{kind:?}: engines to compare");
+        if answers.is_empty() {
+            // This store is not set up here (Postgres without its URL): no
+            // engine of either kind, so nothing to compare.
+            continue;
+        }
+        assert_eq!(
+            answers.len(),
+            2,
+            "{kind:?}: one engine with the loops off and one with them on"
+        );
         let expected = vec![
             json!({ "execution_id": "<run>" }),
             json!({ "completed": true, "work_item_id": "<item>" }),
