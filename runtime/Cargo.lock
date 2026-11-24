@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-a2a-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-agents"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-audit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-ir"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "jamjet-core",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-models"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-policy"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "jamjet-agents",
  "jamjet-core",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-protocols"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "reqwest 0.13.5",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-scheduler"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-state"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-telemetry"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-testkit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-timers"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "jamjet-worker"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
