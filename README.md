@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/SAYnEj86fr)
 
-[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Docs](https://jamjet.dev/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog) · [Discord](https://discord.gg/SAYnEj86fr)
+[jamjet.dev](https://jamjet.dev) · [Quickstart](https://docs.jamjet.dev/en/docs/open-source/quickstart) · [Docs](https://docs.jamjet.dev) · [Examples](examples/) · [Videos](https://www.youtube.com/playlist?list=PLD5Bg9vUNgik) · [Blog](https://jamjet.dev/blog) · [Discord](https://discord.gg/SAYnEj86fr)
 
 [![Open in GitHub Codespaces](https://img.shields.io/badge/Open%20in-Codespaces-blue?style=flat-square&logo=github)](https://codespaces.new/jamjet-labs/jamjet?quickstart=1)
 [![Open in Gitpod](https://img.shields.io/badge/Open%20in-Gitpod-orange?style=flat-square&logo=gitpod)](https://gitpod.io/#https://github.com/jamjet-labs/jamjet)
@@ -27,13 +27,28 @@ JamJet sits underneath your agent (Claude Code, OpenAI Agents SDK, MCP clients, 
 
 - 🛡️ **Block unsafe tool calls** at runtime: database deletes, payments, file writes
 - ✋ **Pause for human approval** on risky actions, durably
-- 💸 **Cap cost** per agent, per run, per project
+- 💸 **Cap tokens and dollars** per run, counted from the run's own event log
 - 📒 **Record an audit trail** of every decision, with approvals signed and hash-chained
 - ⏪ **Replay or resume** crashed runs from the last checkpoint
 
 **Keep your agent framework. Add JamJet where tool calls need control.**
 
-![JamJet safety demo](./demo.gif)
+## Watch it built
+
+The code-along builds one venue-booking agent, a step at a time. Each part is six to seven minutes, and every step has its own folder in [`examples/venue-booking-agent`](examples/venue-booking-agent).
+
+<table>
+<tr>
+<td width="50%"><a href="https://www.youtube.com/watch?v=VVLrZosEwhE"><img src="https://img.youtube.com/vi/VVLrZosEwhE/maxresdefault.jpg" alt="Video: Build your first AI agent, JamJet Python code-along part 1"></a></td>
+<td width="50%"><a href="https://www.youtube.com/watch?v=tnqfI4vZt-g"><img src="https://img.youtube.com/vi/tnqfI4vZt-g/maxresdefault.jpg" alt="Video: Make your AI agent ask before it pays, JamJet Python code-along part 2"></a></td>
+</tr>
+<tr>
+<td valign="top"><b><a href="https://www.youtube.com/watch?v=VVLrZosEwhE">Part 1: Build your first AI agent</a></b><br>An agent with instructions and two tools, then a <code>pay_deposit</code> tool that pays because the prompt said so.</td>
+<td valign="top"><b><a href="https://www.youtube.com/watch?v=tnqfI4vZt-g">Part 2: Make it ask before it pays</a></b><br>A budget cap, an approval before <code>pay_deposit</code> runs, and a tool the agent is never allowed to call.</td>
+</tr>
+</table>
+
+All parts are in the [code-along playlist](https://www.youtube.com/playlist?list=PLD5Bg9vUNgik).
 
 ## See it in 60 seconds
 
@@ -86,8 +101,9 @@ agent = Agent(
     policy={"require_approval_for": ["pay_deposit"], "blocked_tools": ["cancel_*"]},
 )
 
-result = asyncio.run(agent.run_durable("Book a venue in Lisbon for 2026-12-11."))
-print(result.output, result.execution_id)
+if __name__ == "__main__":
+    result = asyncio.run(agent.run_durable("Book a venue in Lisbon for 2026-12-11."))
+    print(result.output, result.execution_id)
 ```
 
 A relative script path is resolved from the working directory of the process that
@@ -115,13 +131,76 @@ The full walkthrough, with the output of each command, is in the
 `jamjet dev` and durable runs need `pip install 'jamjet[sidecar]'`.
 Real providers need `jamjet[model]` as well.
 
-### Watch it built
+## Run a crew of agents as jobs
 
-<a href="https://www.youtube.com/watch?v=VVLrZosEwhE"><img src="https://img.youtube.com/vi/VVLrZosEwhE/maxresdefault.jpg" alt="Video: Build Your First AI Agent with JamJet, Python code-along part 1" width="480"></a>
+Engine 0.6 and Python SDK 0.14 let a crew of agents run as jobs on a serverless container platform such as Cloud Run, with the engine beside them on Postgres. We built these pieces for an agent crew moving to Cloud Run and Cloud SQL.
 
-[Build Your First AI Agent with JamJet](https://www.youtube.com/watch?v=VVLrZosEwhE) is part 1 of the code-along, seven minutes long. It builds this venue-booking agent from an empty folder: an agent with instructions, two tools, then a `pay_deposit` tool that pays because the prompt said so. The code is in [`examples/venue-booking-agent`](examples/venue-booking-agent), one folder per step. The later steps there add approval before the payment, a blocked tool, and an engine killed while the payment waits.
+Each stage of the crew is one agent. A job starts its run and works the run's steps itself. When a person has to decide, the job exits, and it also exits when another worker holds a step for too long. Started again with the same key, it picks up the same run.
 
-Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
+```python
+# job.py: one stage of the crew. Run it as a job, and again after a decision.
+import asyncio, sys
+from jamjet.drive import RunWaiting
+
+from book import agent  # the venue agent above
+
+async def main() -> int:
+    try:
+        result = await agent.run_durable(
+            "Book a venue in Lisbon for 2026-12-11.",
+            run_key="booking:lisbon:2026-12-11",  # a retried job finds this run
+            drive=True,                           # this process works the run's steps
+        )
+    except RunWaiting as w:
+        print(f"waiting for {w.waiting_for} on {w.execution_id}")
+        return 0  # not a failure: start the job again later with the same key
+    print(result.output)
+    return 0
+
+sys.exit(asyncio.run(main()))
+```
+
+Against `jamjet dev --modules venue_tools`, the first start runs the model and tool steps in the job and stops at the approval:
+
+```
+waiting for approval on exec_131df6a6b82147f7866d54eea084f6c4
+```
+
+After `jamjet approve`, the same job with the same key finishes that run. `jamjet executions` lists one run, and `jamjet audit` ends with `pay_deposit ran 1 time, approved by reviewer`.
+
+| A crew needs | What JamJet does |
+|---|---|
+| A retried job must not start a second run | A start with the same `run_key` returns the run the first start made |
+| No worker fleet to keep alive | With `drive=True`, the process that starts the run claims its tool and model steps |
+| Model calls through your own router | `model=Model(backend=...)` sends each call to your router. The engine still holds the answer to the run's model allow list and caps |
+| A ceiling on spend | `token_budget` and `cost_budget_usd` per run. At a cap, the next step that can spend is refused and the run fails. Steps already running finish, so a run can end above its cap by those |
+| A reviewer who picks, not only approves | `options` on a `human_approval` node. The choice and the note are sealed into the audit log and written to `state.__approvals`, so a condition can route on them |
+| An app that shows what is waiting | `GET /approvals`, or `client.list_pending_approvals()`, lists pending approvals across runs |
+| Nothing running between requests | `JAMJET_BACKGROUND=off` turns the engine's loops off, and a scheduler calls `POST /ops/tick` |
+| State that outlives an instance | The Postgres store (preview), with `jamjet-server migrate` before each deploy |
+
+A stage where the reviewer picks between options, with caps on the run:
+
+```yaml
+cost_budget_usd: 2.50
+token_budget: { total_tokens: 50000 }
+
+nodes:
+  pick_topic:
+    type: human_approval
+    description: "Which topic goes out this week?"
+    options:
+      - {id: topic_1, label: "Error handling in Rust"}
+      - {id: topic_2, label: "Durable timers"}
+      - {id: revise, label: "None of these, revise the list"}
+    next: route   # a condition node that reads state.__approvals.pick_topic.choice
+```
+
+```bash
+jamjet approve <id> -d approved --node-id pick_topic --choice revise --note "Too close to last week" --as <name>
+```
+
+The [deployment guide](docs/guides/deployment.md#on-a-serverless-container-platform) has the platform settings, [request-driven mode](docs/guides/deployment.md#request-driven-mode) and [Postgres](docs/guides/deployment.md#postgres-preview). The [Python guide](docs/guides/python-sdk.md#driving-a-run-from-your-own-process) covers drive mode, run keys, your own model router, and what a job should do with each way a run can end.
 
 ## On the JVM
 
@@ -234,7 +313,8 @@ jamjet.cloud.policy("require_approval", "database.*")
 | Agent crashes lose progress | Resume from the last checkpoint |
 | Tool calls rely on scattered app logic | Runtime policy blocks unsafe actions |
 | Human approval is custom glue | Approval is a durable workflow step |
-| Costs are discovered after the bill | Budgets enforced per agent / per run |
+| Costs are discovered after the bill | Token and dollar caps per run, counted from the run's own log |
+| A retried job starts the run a second time | The same `run_key` returns the run the first start made |
 | Audit evidence is stitched from logs | Append-only event log per run; approvals sealed into a signed, hash-chained audit log |
 | Memory is framework-specific | Pair with [Engram](#engram) for portable memory (MCP · REST · Python · Java) |
 | Frameworks stay siloed | One policy file across hooks, MCP clients and SDKs; the runtime is also an MCP server (`/mcp`) |
@@ -247,6 +327,8 @@ The safety layer runs on a durable, event-sourced execution engine. When you wan
 - **Sessions and memory.** Persistent `Session` threads across runs and restarts, with a governed Engram retrieve/record loop. [`examples/session-memory`](examples/session-memory).
 - **Multi-agent.** `Sequential`, `Parallel`, coordinator `Team`, and `Loop`; each sub-agent runs as its own governed durable execution. [`examples/team-multi-agent`](examples/team-multi-agent). Declare whole fleets in YAML with cron schedules: [`examples/fleet`](examples/fleet).
 - **Evaluation.** Batch eval with LLM-judge scoring ([`examples/eval-harness`](examples/eval-harness)) and trajectory regression diffs ([`examples/trajectory-eval`](examples/trajectory-eval)).
+- **Storage.** SQLite by default, and a Postgres store (preview) for runs, events, the audit log and agents, migrated with `jamjet-server migrate`. [Deployment guide](docs/guides/deployment.md#postgres-preview).
+- **Request-driven mode.** With `JAMJET_BACKGROUND=off` the engine runs no loops of its own: each request advances its run, and a scheduler calls `POST /ops/tick` for approval deadlines and lapsed leases. [Request-driven mode](docs/guides/deployment.md#request-driven-mode).
 - **Deploy.** `agent.deploy(runtime="local" | "self-host" | "cloud")` ships the same compiled IR to any runtime. [`examples/deploy-an-agent`](examples/deploy-an-agent).
 - **Dev loop.** `jamjet create` scaffolds a project; `jamjet dev` runs the whole local stack with one command.
 - **Web Companion.** A UI embedded in the runtime binary: graph view, timeline and state inspector.
@@ -269,7 +351,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 | Example | What it shows |
 |---------|--------------|
 | [`01-block-unsafe-tool`](examples/01-block-unsafe-tool) | A destructive tool call blocked before execution |
-| [`venue-booking-agent`](examples/venue-booking-agent) | The video code-along: one agent in nine steps, from a first tool to approval, a blocked tool and `kill -9` |
+| [`venue-booking-agent`](examples/venue-booking-agent) | The video code-along: one agent in twelve steps, from a first tool to approval, a blocked tool, `kill -9`, a venue reply that gives orders, and tools that refuse a venue they do not know |
 | [`hitl-approval`](examples/hitl-approval) | Human approval as a first-class workflow primitive |
 | [`react-agent-durable`](examples/react-agent-durable) | A ReAct agent on the durable engine: event log, replay, park-on-429 |
 | [`team-multi-agent`](examples/team-multi-agent) | Multi-agent Teams, each sub-agent its own governed run |
@@ -308,7 +390,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 │    Model adapters  |  Model sidecar  |  External workers │
 ├──────────────────────────────────────────────────────────┤
 │                         Storage                          │
-│             SQLite  |  In-memory (ephemeral)             │
+│ SQLite  |  Postgres (preview)  |  In-memory (ephemeral)  │
 └──────────────────────────────────────────────────────────┘
 ```
 
